@@ -3,6 +3,7 @@ use super::*;
 /// A cached, laid-out block. Rebuilt only when its runs, kind, or the available
 /// width changes — so events and paint can both query geometry cheaply.
 pub(super) struct BlockLayout {
+    pub(super) block: Block,
     pub(super) layout: Layout<BrushIndex>,
     pub(super) runs: Vec<TextRun>,
     pub(super) text: String,
@@ -27,6 +28,7 @@ impl BlockLayout {
 pub(super) fn build_block_layout(
     fcx: &mut FontContext,
     lcx: &mut LayoutContext<BrushIndex>,
+    block: Block,
     runs: Vec<TextRun>,
     kind: BlockKind,
     width: f32,
@@ -37,6 +39,7 @@ pub(super) fn build_block_layout(
     let (line_height, _) = block_metrics(kind);
     let height = (layout.height() as f64).max(kind.font_size() as f64 * line_height as f64);
     BlockLayout {
+        block,
         layout,
         runs,
         text,
@@ -135,6 +138,65 @@ pub(super) fn clamp_position(pos: &mut Position, layouts: &[BlockLayout]) {
     }
 }
 
+/// A width change that is waiting for a live resize to settle before the
+/// document is re-shaped. Re-shaping on every resize event is far too
+/// expensive, so a change is deferred until the width has held still for
+/// [`REFLOW_DELAY`].
+pub(super) struct Reflow {
+    pending: Option<f32>,
+    changed_at: Instant,
+    force: bool,
+}
+
+impl Reflow {
+    pub(super) fn new() -> Self {
+        Self {
+            pending: None,
+            changed_at: Instant::now(),
+            force: false,
+        }
+    }
+
+    /// Remember a target width, restarting the settle window when it changes.
+    pub(super) fn defer(&mut self, width: f32) {
+        if self.pending != Some(width) {
+            self.pending = Some(width);
+            self.changed_at = Instant::now();
+        }
+    }
+
+    /// Whether the deferred width has settled and differs from `current`.
+    pub(super) fn ready(&self, current: f32) -> bool {
+        self.pending.is_some_and(|width| {
+            self.changed_at.elapsed() >= REFLOW_DELAY && (current - width).abs() > f32::EPSILON
+        })
+    }
+
+    /// Mark a settled reflow for application on the next layout pass.
+    pub(super) fn request(&mut self) {
+        self.force = true;
+    }
+
+    pub(super) fn forced(&self) -> bool {
+        self.force
+    }
+
+    /// Clear after a re-shape has been performed.
+    pub(super) fn finish(&mut self) {
+        self.pending = None;
+        self.force = false;
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.finish();
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending(&self) -> Option<f32> {
+        self.pending
+    }
+}
+
 impl Editor {
     /// Left edge of a block's text (page margin plus any bullet indent).
     pub(super) fn block_text_x(&self, block: &BlockLayout) -> f64 {
@@ -149,28 +211,40 @@ impl Editor {
         lcx: &mut LayoutContext<BrushIndex>,
         width: f32,
     ) {
-        let snapshot = self.doc.snapshot();
+        // Shape at whole logical pixels: sub-pixel width changes (which a live
+        // resize can produce) would otherwise force a full re-shape.
+        let width = width.round();
 
-        let added_or_removed = self.layouts.len() != snapshot.len();
+        // Edits always set `layouts_dirty`, and only the editor mutates the
+        // document, so when nothing is dirty and the width is unchanged the
+        // cached layouts are still valid. Checking that first avoids snapshotting
+        // every block on the many no-op layout passes a frame can trigger.
         let width_changed = self.layout_width != width;
-        let stale = self.layouts_dirty
-            || width_changed
+        let added_or_removed = self.layouts.len() != self.doc.len();
+        let immediate = self.layouts_dirty
             || added_or_removed
-            || self
-                .layouts
-                .iter()
-                .zip(&snapshot)
-                .any(|(cached, data)| cached.runs != data.runs || cached.kind != data.kind);
+            || self.reflow.forced()
+            || self.layouts.is_empty();
 
-        self.blocks = snapshot.iter().map(|data| data.block.clone()).collect();
-        if !stale {
+        // Re-shaping every block on each resize event is far too expensive, so
+        // keep the previous layouts and defer until the width stops changing.
+        if width_changed && !immediate {
+            self.reflow.defer(width);
             return;
         }
+        if !width_changed && !immediate {
+            return;
+        }
+
+        self.reflow.finish();
+
+        let snapshot = self.doc.snapshot();
+        let added_or_removed = self.layouts.len() != snapshot.len();
 
         if width_changed || added_or_removed {
             self.layouts = snapshot
                 .into_iter()
-                .map(|data| build_block_layout(fcx, lcx, data.runs, data.kind, width))
+                .map(|data| build_block_layout(fcx, lcx, data.block, data.runs, data.kind, width))
                 .collect();
         } else {
             // Rebuild only the blocks whose runs or kind actually changed; reuse
@@ -178,7 +252,8 @@ impl Editor {
             for (index, data) in snapshot.into_iter().enumerate() {
                 let cached = &self.layouts[index];
                 if cached.runs != data.runs || cached.kind != data.kind {
-                    self.layouts[index] = build_block_layout(fcx, lcx, data.runs, data.kind, width);
+                    self.layouts[index] =
+                        build_block_layout(fcx, lcx, data.block, data.runs, data.kind, width);
                 }
             }
         }
@@ -200,6 +275,10 @@ impl Editor {
         clamp_position(&mut self.selection.focus, &self.layouts);
     }
 
+    /// Re-shape the document after an edit. The *cached* `layout_width` is used
+    /// deliberately: during a live resize a new width is pending, and shaping to
+    /// it here would defeat the deferred reflow, so edits keep the old wrap until
+    /// the resize settles.
     pub(super) fn refresh_layouts(&mut self, ctx: &mut EventCtx<'_>) {
         if self.layout_width <= 0.0 {
             return;
@@ -207,5 +286,29 @@ impl Editor {
         let width = self.layout_width;
         let (fcx, lcx) = ctx.text_contexts();
         self.ensure_layouts(fcx, lcx, width);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reflow_defers_until_the_width_settles() {
+        let mut reflow = Reflow::new();
+        reflow.defer(720.0);
+
+        // Deferred for a moment after the change...
+        assert!(!reflow.ready(800.0));
+        // ...and never applies when the width did not actually change.
+        std::thread::sleep(REFLOW_DELAY + std::time::Duration::from_millis(20));
+        assert!(reflow.ready(800.0));
+        assert!(!reflow.ready(720.0));
+
+        reflow.request();
+        assert!(reflow.forced());
+        reflow.finish();
+        assert!(!reflow.forced());
+        assert!(reflow.pending().is_none());
     }
 }

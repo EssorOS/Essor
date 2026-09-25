@@ -12,6 +12,15 @@ impl Editor {
     }
 
     pub(super) fn scroll_caret_into_view(&self, ctx: &mut EventCtx<'_>) {
+        // When the document already fits the viewport there is nothing to scroll,
+        // and asking the enclosing `Portal` to pan it makes the Portal divide by
+        // zero to recompute its scrollbar thumb progress. That stores `NaN`, which
+        // the scrollbar then renders with garbage geometry until some later scroll
+        // recomputes it — so the scrollbar goes missing and the frame blows up. Skip
+        // the request entirely while the content fits.
+        if self.viewport_height <= 0.0 || self.content_height <= self.viewport_height {
+            return;
+        }
         if let Some(rect) = self.focus_rect() {
             ctx.request_scroll_to(rect);
         }

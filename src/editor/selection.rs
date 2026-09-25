@@ -1,7 +1,7 @@
 use super::*;
 
 /// A point in the document: a block index plus a byte offset within that block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Position {
     pub(super) block: usize,
     pub(super) offset: usize,
@@ -31,6 +31,7 @@ pub(super) struct DragSpan {
 }
 
 /// Cursor and selection state for the editor.
+#[derive(Default)]
 pub(super) struct SelectionState {
     pub(super) anchor: Position,
     pub(super) focus: Position,

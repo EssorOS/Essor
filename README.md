@@ -19,8 +19,11 @@ real-time collaboration and undo/redo without a custom history layer.
 - **Rich text editing** — word/line-aware selection, grapheme-correct caret
   motion (combining marks, emoji ZWJ sequences), IME composition, and
   clipboard cut/copy/paste.
+- **Document sidebar** — create new pages, switch between them, and delete
+  them (with confirmation) from a list down the left edge.
 - **Undo / redo** driven by the CRDT's undo manager.
-- **Autosave** — the document is persisted to a `.ydoc` file after every edit.
+- **Autosave** — each document is persisted to its own `.ydoc` file after every
+  edit, with the page list tracked in a small JSON index.
 - **GPU rendering** — text is shaped with Parley and painted with Vello.
 
 ## Requirements
@@ -50,17 +53,21 @@ cargo test
 By default the app installs a quiet log subscriber. Set `RUST_LOG` to control
 logging (for example `RUST_LOG=warn` or `RUST_LOG=debug`).
 
-## Where the document is stored
+## Where documents are stored
 
-The document is saved as a Yjs update file at:
+Each page is saved as its own Yjs update file, with the ordered list and active
+page in an index:
 
 ```
-<data dir>/essor/essor.ydoc
+<data dir>/essor/documents.json
+<data dir>/essor/documents/<id>.ydoc
 ```
 
-On macOS that is typically
-`~/Library/Application Support/essor/essor.ydoc`. Delete the file to start
-from a blank document.
+On macOS that is typically under
+`~/Library/Application Support/essor/`. Delete the directory to start over.
+
+An older single-document `essor.ydoc` is migrated into the list automatically
+on first launch.
 
 ## Keyboard and mouse
 
@@ -88,6 +95,11 @@ The document model lives behind the `Doc` trait in `src/doc.rs`, so the UI
 never depends on the CRDT crate directly. The current backend is
 `YrsDocument`, a `yrs` (Yjs) document holding a root array of block maps, each
 with a `kind` and a rich `Y.Text`.
+
+`src/library.rs` owns the set of on-disk documents (the files and the JSON
+index) and `src/sidebar.rs` is the custom-painted document list. The root layout
+is a `Flex` row of the sidebar and a scrolling editor; the sidebar emits
+`SidebarAction`s that `main.rs` handles by swapping the editor's `Doc`.
 
 The editor widget is split into focused modules under `src/editor/`:
 

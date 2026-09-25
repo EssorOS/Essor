@@ -52,13 +52,20 @@ pub(super) fn text_label(
 impl Editor {
     // --- painting ---------------------------------------------------------
 
-    pub(super) fn paint_background(&self, scene: &mut Scene, size: Size) {
+    /// Fills only the visible slice of the page. The editor reports its full
+    /// document height (so the `Portal` can scroll it), and a full-height
+    /// background would make every repaint GPU-bound for long documents.
+    pub(super) fn paint_background(&self, scene: &mut Scene, size: Size, visible: Visible) {
+        let (y0, y1) = visible.clamped_to(size.height);
+        if y1 <= y0 {
+            return;
+        }
         scene.fill(
             Fill::NonZero,
             Affine::IDENTITY,
             BACKGROUND,
             None,
-            &size.to_rect(),
+            &Rect::from_origin_size((0.0, y0), (size.width, y1 - y0)),
         );
     }
 
@@ -68,13 +75,18 @@ impl Editor {
         font_cx: &mut FontContext,
         layout_cx: &mut LayoutContext<BrushIndex>,
         focused: bool,
+        visible: Visible,
     ) {
         let caret_block = self.selection.focus.block;
         let caret_offset = self.selection.focus.offset;
 
         for (index, block) in self.layouts.iter().enumerate() {
+            if !visible.contains(block.top, block.height) {
+                continue;
+            }
             let text_x = self.block_text_x(block);
             let block_width = block.wrap;
+            let block_top = block.top;
 
             if let Some((from, to)) = self
                 .selection_in_block(index)
@@ -84,7 +96,7 @@ impl Editor {
                 let focus = block.cursor_at(to);
                 for (bounds, _) in Selection::new(anchor, focus).geometry(&block.layout) {
                     let rect = Rect::from_origin_size(
-                        (text_x + bounds.x0, block.top + bounds.y0),
+                        (text_x + bounds.x0, block_top + bounds.y0),
                         ((bounds.x1 - bounds.x0).max(1.0), bounds.y1 - bounds.y0),
                     );
                     scene.fill(Fill::NonZero, Affine::IDENTITY, SELECTION, None, &rect);
@@ -94,7 +106,7 @@ impl Editor {
             if block.kind == BlockKind::Bullet {
                 let center = (
                     text_x - BULLET_INDENT * 0.5,
-                    block.top + line_center(&block.layout, 0) as f64,
+                    block_top + line_center(&block.layout, 0) as f64,
                 );
                 scene.fill(
                     Fill::NonZero,
@@ -107,7 +119,7 @@ impl Editor {
 
             masonry::core::render_text(
                 scene,
-                Affine::translate((text_x, block.top)),
+                Affine::translate((text_x, block_top)),
                 &block.layout,
                 &[Brush::Solid(TEXT)],
                 true,
@@ -131,7 +143,7 @@ impl Editor {
                 let layout = build_layout(font_cx, layout_cx, &[run], block.kind, block_width);
                 masonry::core::render_text(
                     scene,
-                    Affine::translate((text_x, block.top)),
+                    Affine::translate((text_x, block_top)),
                     &layout,
                     &[Brush::Solid(PLACEHOLDER)],
                     true,
@@ -142,7 +154,7 @@ impl Editor {
                 let cursor = block.cursor_at(caret_offset);
                 let bounds = cursor.geometry(&block.layout, block_width);
                 let rect = Rect::from_origin_size(
-                    (text_x + bounds.x0, block.top + bounds.y0),
+                    (text_x + bounds.x0, block_top + bounds.y0),
                     (CARET_WIDTH, (bounds.y1 - bounds.y0).max(1.0)),
                 );
                 scene.fill(Fill::NonZero, Affine::IDENTITY, CARET, None, &rect);

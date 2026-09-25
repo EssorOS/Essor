@@ -171,6 +171,25 @@ impl YrsDocument {
     fn touch(&self) {
         self.dirty.set(true);
     }
+
+    /// Encode the current state and atomically replace the backing file.
+    fn write_to_disk(&self) -> std::io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let txn = self.doc.transact();
+        let update = txn.encode_state_as_update_v1(&StateVector::default());
+        drop(txn);
+        crate::fs::atomic_write(path, &update)
+    }
+
+    /// Persist immediately, even when there are no unsaved changes. Used to
+    /// materialise a freshly created document on disk.
+    pub fn save_now(&self) -> std::io::Result<()> {
+        self.write_to_disk()?;
+        self.dirty.set(false);
+        Ok(())
+    }
 }
 
 impl Default for YrsDocument {
@@ -294,22 +313,10 @@ impl Doc for YrsDocument {
     }
 
     fn persist(&self) -> std::io::Result<()> {
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
         if !self.dirty.get() {
             return Ok(());
         }
-        let txn = self.doc.transact();
-        let update = txn.encode_state_as_update_v1(&StateVector::default());
-        drop(txn);
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &update)?;
-        std::fs::rename(&tmp, path)?;
+        self.write_to_disk()?;
         self.dirty.set(false);
         Ok(())
     }

@@ -41,13 +41,29 @@ fn data_dir() -> Option<PathBuf> {
 /// Prevent macOS from stretching the last frame while the window is resized.
 ///
 /// By default AppKit scales layer contents to the new bounds during a live resize,
-/// which makes text momentarily appear stretched. Anchoring the contents top-left
-/// makes it clip/reveal instead. Returns `true` once at least one window was set up.
+/// which makes text momentarily appear stretched. Anchoring the contents at the
+/// visual top-left makes it clip/reveal instead. Returns `true` once at least one
+/// window was set up.
 #[cfg(target_os = "macos")]
 fn configure_live_resize() -> bool {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSApplication;
-    use objc2_quartz_core::kCAGravityTopLeft;
+    use objc2_quartz_core::{CALayer, kCAGravityBottomLeft, kCAGravityTopLeft};
+
+    // `contentsGravity` is resolved in the layer's own coordinate space. Winit's
+    // view is flipped, so `Top` would land at the visual bottom; pick the
+    // constant that actually anchors the contents at the visual top.
+    let anchor_top_left = |layer: &CALayer| {
+        // SAFETY: Both are framework-provided constants.
+        let gravity = unsafe {
+            if layer.contentsAreFlipped() {
+                kCAGravityBottomLeft
+            } else {
+                kCAGravityTopLeft
+            }
+        };
+        layer.setContentsGravity(gravity);
+    };
 
     let Some(mtm) = MainThreadMarker::new() else {
         return false;
@@ -59,13 +75,11 @@ fn configure_live_resize() -> bool {
         if let Some(view) = window.contentView()
             && let Some(layer) = view.layer()
         {
-            // SAFETY: `kCAGravityTopLeft` is a framework-provided constant.
-            let gravity = unsafe { kCAGravityTopLeft };
-            layer.setContentsGravity(gravity);
+            anchor_top_left(&layer);
             // The wgpu render layer is usually a sublayer, so pin it too.
             if let Some(sublayers) = unsafe { layer.sublayers() } {
                 for sublayer in sublayers.iter() {
-                    sublayer.setContentsGravity(gravity);
+                    anchor_top_left(&sublayer);
                 }
             }
             configured = true;

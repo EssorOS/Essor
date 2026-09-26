@@ -1,14 +1,14 @@
 use super::*;
 
-/// A point in the document: a block index plus a byte offset within that block.
+/// A point in the document: a block id plus a byte offset within that block.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Position {
-    pub(super) block: usize,
+    pub(super) block: BlockId,
     pub(super) offset: usize,
 }
 
 impl Position {
-    pub(super) fn new(block: usize, offset: usize) -> Self {
+    pub(super) fn new(block: BlockId, offset: usize) -> Self {
         Self { block, offset }
     }
 }
@@ -24,7 +24,7 @@ enum Granularity {
 /// extends from this whole span rather than from a single caret.
 #[derive(Clone, Copy)]
 pub(super) struct DragSpan {
-    block: usize,
+    block: BlockId,
     start: usize,
     end: usize,
     granularity: Granularity,
@@ -42,6 +42,51 @@ pub(super) struct SelectionState {
     pub(super) drag_span: Option<DragSpan>,
 }
 
+impl SelectionState {
+    /// Re-anchor the selection after layouts are rebuilt. A position whose block
+    /// survived keeps its offset (clamped to the new text); one whose block was
+    /// deleted — remotely, or by undo — snaps to the block now occupying its old
+    /// slot. This is the only place a remote structural edit moves the caret.
+    pub(super) fn reconcile(
+        &mut self,
+        old_index: &HashMap<BlockId, usize>,
+        layouts: &[BlockLayout],
+        index_of: &HashMap<BlockId, usize>,
+    ) {
+        reconcile_position(&mut self.anchor, old_index, layouts, index_of);
+        reconcile_position(&mut self.focus, old_index, layouts, index_of);
+        self.preferred_x = None;
+        if self
+            .drag_span
+            .is_some_and(|span| !index_of.contains_key(&span.block))
+        {
+            self.drag_span = None;
+        }
+    }
+}
+
+fn reconcile_position(
+    pos: &mut Position,
+    old_index: &HashMap<BlockId, usize>,
+    layouts: &[BlockLayout],
+    index_of: &HashMap<BlockId, usize>,
+) {
+    if let Some(&index) = index_of.get(&pos.block) {
+        if let Some(layout) = layouts.get(index) {
+            pos.offset = clamp_char_boundary(&layout.text, pos.offset);
+        }
+        return;
+    }
+    // The block is gone; snap to the block now at its old position.
+    let hint = old_index.get(&pos.block).copied().unwrap_or(0);
+    if let Some(layout) = layouts.get(hint.min(layouts.len().saturating_sub(1))) {
+        pos.block = layout.id;
+        pos.offset = 0;
+    }
+    // An empty document leaves the stale id in place; every operation no-ops
+    // until a block exists again.
+}
+
 impl Editor {
     // --- selection model --------------------------------------------------
 
@@ -51,7 +96,11 @@ impl Editor {
 
     pub(super) fn selection(&self) -> (Position, Position) {
         let (a, f) = (self.selection.anchor, self.selection.focus);
-        if a.block < f.block || (a.block == f.block && a.offset <= f.offset) {
+        let (a_index, f_index) = (
+            self.index_of(a.block).unwrap_or(0),
+            self.index_of(f.block).unwrap_or(0),
+        );
+        if a_index < f_index || (a_index == f_index && a.offset <= f.offset) {
             (a, f)
         } else {
             (f, a)
@@ -80,16 +129,18 @@ impl Editor {
             return None;
         }
         let (start, end) = self.selection();
-        if index < start.block || index > end.block {
+        let start_index = self.index_of(start.block)?;
+        let end_index = self.index_of(end.block)?;
+        if index < start_index || index > end_index {
             return None;
         }
         let layout = self.layouts.get(index)?;
-        let from = if index == start.block {
+        let from = if index == start_index {
             clamp_char_boundary(&layout.text, start.offset)
         } else {
             0
         };
-        let to = if index == end.block {
+        let to = if index == end_index {
             clamp_char_boundary(&layout.text, end.offset)
         } else {
             layout.text.len()
@@ -102,14 +153,14 @@ impl Editor {
     pub(super) fn hit_test(&self, point: Point) -> Position {
         let index = self.block_at_y(point.y);
         let Some(block) = self.layouts.get(index) else {
-            return Position::new(0, 0);
+            return Position::default();
         };
         let cursor = Cursor::from_point(
             &block.layout,
             (point.x - self.block_text_x(block)) as f32,
             (point.y - block.top) as f32,
         );
-        Position::new(index, cursor.index())
+        Position::new(block.id, cursor.index())
     }
 
     /// Select a word (double click) or the whole block (triple click) at `point`.
@@ -134,10 +185,10 @@ impl Editor {
         let a = selection.anchor().index();
         let f = selection.focus().index();
         let (start, end) = (a.min(f), a.max(f));
-        self.selection.anchor = Position::new(index, start);
-        self.selection.focus = Position::new(index, end);
+        self.selection.anchor = Position::new(block.id, start);
+        self.selection.focus = Position::new(block.id, end);
         self.selection.drag_span = Some(DragSpan {
-            block: index,
+            block: block.id,
             start,
             end,
             granularity,
@@ -151,22 +202,29 @@ impl Editor {
             self.selection.focus = self.hit_test(point);
             return;
         };
+        let Some(span_index) = self.index_of(span.block) else {
+            return;
+        };
 
         let target = self.block_at_y(point.y);
-        if target != span.block {
+        if target != span_index {
             // Dragged into another block: keep the span and extend to the edge.
-            if target < span.block {
+            if target < span_index {
                 self.selection.anchor = Position::new(span.block, span.end);
-                self.selection.focus = Position::new(target, 0);
+                if let Some(id) = self.block(target) {
+                    self.selection.focus = Position::new(id, 0);
+                }
             } else {
                 self.selection.anchor = Position::new(span.block, span.start);
-                let len = self.layouts.get(target).map_or(0, |block| block.text.len());
-                self.selection.focus = Position::new(target, len);
+                if let Some(target) = self.layouts.get(target) {
+                    let (id, len) = (target.id, target.text.len());
+                    self.selection.focus = Position::new(id, len);
+                }
             }
             return;
         }
 
-        let Some(block) = self.layouts.get(span.block) else {
+        let Some(block) = self.layouts.get(span_index) else {
             return;
         };
         let x = (point.x - self.block_text_x(block)) as f32;

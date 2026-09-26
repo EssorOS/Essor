@@ -3,7 +3,7 @@ use super::*;
 /// A cached, laid-out block. Rebuilt only when its runs, kind, or the available
 /// width changes — so events and paint can both query geometry cheaply.
 pub(super) struct BlockLayout {
-    pub(super) block: Block,
+    pub(super) id: BlockId,
     pub(super) layout: Layout<BrushIndex>,
     pub(super) runs: Vec<TextRun>,
     pub(super) text: String,
@@ -28,7 +28,7 @@ impl BlockLayout {
 pub(super) fn build_block_layout(
     fcx: &mut FontContext,
     lcx: &mut LayoutContext<BrushIndex>,
-    block: Block,
+    id: BlockId,
     runs: Vec<TextRun>,
     kind: BlockKind,
     width: f32,
@@ -39,7 +39,7 @@ pub(super) fn build_block_layout(
     let (line_height, _) = block_metrics(kind);
     let height = (layout.height() as f64).max(kind.font_size() as f64 * line_height as f64);
     BlockLayout {
-        block,
+        id,
         layout,
         runs,
         text,
@@ -122,20 +122,6 @@ pub(super) fn line_center(layout: &Layout<BrushIndex>, line: usize) -> f32 {
             metrics.baseline - (metrics.ascent - metrics.descent) * 0.5
         })
         .unwrap_or(0.0)
-}
-
-pub(super) fn clamp_position(pos: &mut Position, layouts: &[BlockLayout]) {
-    let Some(last) = layouts.len().checked_sub(1) else {
-        *pos = Position::new(0, 0);
-        return;
-    };
-    if pos.block > last {
-        pos.block = last;
-        pos.offset = 0;
-    }
-    if let Some(layout) = layouts.get(pos.block) {
-        pos.offset = clamp_char_boundary(&layout.text, pos.offset);
-    }
 }
 
 /// A width change that is waiting for a live resize to settle before the
@@ -239,12 +225,22 @@ impl Editor {
         self.reflow.finish();
 
         let snapshot = self.doc.snapshot();
-        let added_or_removed = self.layouts.len() != snapshot.len();
+        // A remote edit can insert and remove a block at once, keeping the
+        // length the same while shifting every id after it. Compare the id
+        // sequence, not just the length, before reusing cached layouts.
+        let ids_changed = self.layouts.len() != snapshot.len()
+            || self
+                .layouts
+                .iter()
+                .zip(&snapshot)
+                .any(|(cached, data)| cached.id != data.id);
 
-        if width_changed || added_or_removed {
+        let old_index = std::mem::take(&mut self.block_index);
+
+        if width_changed || ids_changed {
             self.layouts = snapshot
                 .into_iter()
-                .map(|data| build_block_layout(fcx, lcx, data.block, data.runs, data.kind, width))
+                .map(|data| build_block_layout(fcx, lcx, data.id, data.runs, data.kind, width))
                 .collect();
         } else {
             // Rebuild only the blocks whose runs or kind actually changed; reuse
@@ -253,12 +249,18 @@ impl Editor {
                 let cached = &self.layouts[index];
                 if cached.runs != data.runs || cached.kind != data.kind {
                     self.layouts[index] =
-                        build_block_layout(fcx, lcx, data.block, data.runs, data.kind, width);
+                        build_block_layout(fcx, lcx, data.id, data.runs, data.kind, width);
                 }
             }
         }
         self.layout_width = width;
         self.layouts_dirty = false;
+        self.block_index = self
+            .layouts
+            .iter()
+            .enumerate()
+            .map(|(index, layout)| (layout.id, index))
+            .collect();
 
         let mut y = PAGE_TOP;
         for (index, layout) in self.layouts.iter_mut().enumerate() {
@@ -271,8 +273,8 @@ impl Editor {
         }
         self.content_height = y + PAGE_BOTTOM;
 
-        clamp_position(&mut self.selection.anchor, &self.layouts);
-        clamp_position(&mut self.selection.focus, &self.layouts);
+        self.selection
+            .reconcile(&old_index, &self.layouts, &self.block_index);
     }
 
     /// Re-shape the document after an edit. The *cached* `layout_width` is used

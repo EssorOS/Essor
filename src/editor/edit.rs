@@ -14,27 +14,49 @@ pub(super) enum KeyHandled {
 impl Editor {
     // --- editing operations ----------------------------------------------
 
+    /// The block at the caret, and its current index, lazily seeding one when
+    /// the document is still empty.
+    ///
+    /// Documents materialised from a peer's list start with no blocks and receive
+    /// their content over sync. If the user edits before that content arrives we
+    /// create a block so the page stays usable. The peer's own seed block may
+    /// later merge alongside it, which is harmless: both are preserved.
+    fn editable_block(&mut self) -> Option<(BlockId, usize)> {
+        if let Some(index) = self.index_of(self.selection.focus.block)
+            && let Some(layout) = self.layouts.get(index)
+        {
+            return Some((layout.id, index));
+        }
+        if self.doc.is_empty() {
+            let block = self.doc.insert_block(0);
+            self.set_caret(Position::new(block, 0));
+            self.layouts_dirty = true;
+            return Some((block, 0));
+        }
+        None
+    }
+
     pub(super) fn insert_text(&mut self, text: &str) {
         self.delete_selection();
         let pos = self.selection.focus;
-        let Some(block) = self.block(pos.block) else {
+        let Some((block, _)) = self.editable_block() else {
             return;
         };
-        let mut value = self.doc.text(&block);
+        let mut value = self.doc.text(block);
         let at = clamp_char_boundary(&value, pos.offset);
         value.insert_str(at, text);
-        self.doc.set_text(&block, &value);
-        self.set_caret(Position::new(pos.block, at + text.len()));
+        self.doc.set_text(block, &value);
+        self.set_caret(Position::new(block, at + text.len()));
         self.layouts_dirty = true;
 
         // Markdown-style block rules: "# ", "## ", "- " on a paragraph.
-        if self.doc.kind(&block) == BlockKind::Paragraph
+        if self.doc.kind(block) == BlockKind::Paragraph
             && let Some((kind, marker_len)) = block_prefix(&value)
         {
-            self.doc.set_kind(&block, kind);
-            self.doc.set_text(&block, &value[marker_len..]);
-            self.set_caret(Position::new(pos.block, 0));
-        } else if value == "/" && self.doc.kind(&block) == BlockKind::Paragraph {
+            self.doc.set_kind(block, kind);
+            self.doc.set_text(block, &value[marker_len..]);
+            self.set_caret(Position::new(block, 0));
+        } else if value == "/" && self.doc.kind(block) == BlockKind::Paragraph {
             self.open_slash_menu();
         }
     }
@@ -44,7 +66,12 @@ impl Editor {
             return;
         }
         let (start, end) = self.selection();
-        for index in start.block..=end.block {
+        let (Some(start_index), Some(end_index)) =
+            (self.index_of(start.block), self.index_of(end.block))
+        else {
+            return;
+        };
+        for index in start_index..=end_index {
             let Some((from, to)) = self
                 .selection_in_block(index)
                 .filter(|(from, to)| from < to)
@@ -54,18 +81,23 @@ impl Editor {
             let Some(block) = self.block(index) else {
                 continue;
             };
-            let runs = self.doc.runs(&block);
+            let runs = self.doc.runs(block);
             let on = !range_marked(&runs, from, to, mark);
-            self.doc.mark(&block, from, to, mark, on);
+            self.doc.mark(block, from, to, mark, on);
         }
         self.layouts_dirty = true;
     }
 
     pub(super) fn set_selected_kind(&mut self, kind: BlockKind) {
         let (start, end) = self.selection();
-        for index in start.block..=end.block {
+        let (Some(start_index), Some(end_index)) =
+            (self.index_of(start.block), self.index_of(end.block))
+        else {
+            return;
+        };
+        for index in start_index..=end_index {
             if let Some(block) = self.block(index) {
-                self.doc.set_kind(&block, kind);
+                self.doc.set_kind(block, kind);
             }
         }
         self.layouts_dirty = true;
@@ -74,16 +106,16 @@ impl Editor {
     pub(super) fn split(&mut self) {
         self.delete_selection();
         let pos = self.selection.focus;
-        let Some(block) = self.block(pos.block) else {
+        let Some((block, index)) = self.editable_block() else {
             return;
         };
-        let value = self.doc.text(&block);
+        let value = self.doc.text(block);
         let at = clamp_char_boundary(&value, pos.offset);
         let right = value[at..].to_string();
-        self.doc.set_text(&block, &value[..at]);
-        let next = self.doc.insert_block(pos.block + 1);
-        self.doc.set_text(&next, &right);
-        self.set_caret(Position::new(pos.block + 1, 0));
+        self.doc.set_text(block, &value[..at]);
+        let next = self.doc.insert_block(index + 1);
+        self.doc.set_text(next, &right);
+        self.set_caret(Position::new(next, 0));
         self.layouts_dirty = true;
     }
 
@@ -93,26 +125,29 @@ impl Editor {
             return;
         }
         let pos = self.selection.focus;
-        let Some(block) = self.block(pos.block) else {
+        let Some(index) = self.index_of(pos.block) else {
             return;
         };
-        let value = self.doc.text(&block);
+        let Some(block) = self.block(index) else {
+            return;
+        };
+        let value = self.doc.text(block);
         if pos.offset > 0 {
             let at = clamp_char_boundary(&value, pos.offset);
             let prev = prev_grapheme(&value, at);
             let mut merged = value;
             merged.replace_range(prev..at, "");
-            self.doc.set_text(&block, &merged);
-            self.set_caret(Position::new(pos.block, prev));
-        } else if pos.block > 0 {
-            let Some(previous) = self.block(pos.block - 1) else {
+            self.doc.set_text(block, &merged);
+            self.set_caret(Position::new(block, prev));
+        } else if index > 0 {
+            let Some(previous) = self.block(index - 1) else {
                 return;
             };
-            let before = self.doc.text(&previous);
+            let before = self.doc.text(previous);
             let at = before.len();
-            self.doc.set_text(&previous, &format!("{before}{value}"));
-            self.doc.remove_block(pos.block);
-            self.set_caret(Position::new(pos.block - 1, at));
+            self.doc.set_text(previous, &format!("{before}{value}"));
+            self.doc.remove_block(block);
+            self.set_caret(Position::new(previous, at));
         }
         self.layouts_dirty = true;
     }
@@ -123,23 +158,26 @@ impl Editor {
             return;
         }
         let pos = self.selection.focus;
-        let Some(block) = self.block(pos.block) else {
+        let Some(index) = self.index_of(pos.block) else {
             return;
         };
-        let value = self.doc.text(&block);
+        let Some(block) = self.block(index) else {
+            return;
+        };
+        let value = self.doc.text(block);
         if pos.offset < value.len() {
             let at = clamp_char_boundary(&value, pos.offset);
             let next = next_grapheme(&value, at);
             let mut merged = value;
             merged.replace_range(at..next, "");
-            self.doc.set_text(&block, &merged);
-        } else if pos.block + 1 < self.doc.len() {
-            let Some(following) = self.block(pos.block + 1) else {
+            self.doc.set_text(block, &merged);
+        } else if index + 1 < self.doc.len() {
+            let Some(following) = self.block(index + 1) else {
                 return;
             };
-            let after = self.doc.text(&following);
-            self.doc.set_text(&block, &format!("{value}{after}"));
-            self.doc.remove_block(pos.block + 1);
+            let after = self.doc.text(following);
+            self.doc.set_text(block, &format!("{value}{after}"));
+            self.doc.remove_block(following);
         }
         self.layouts_dirty = true;
     }
@@ -149,30 +187,39 @@ impl Editor {
             return;
         }
         let (start, end) = self.selection();
-        let Some(start_block) = self.block(start.block) else {
+        let (Some(start_index), Some(end_index)) =
+            (self.index_of(start.block), self.index_of(end.block))
+        else {
             return;
         };
-        let Some(end_block) = self.block(end.block) else {
+        let (Some(start_block), Some(end_block)) = (self.block(start_index), self.block(end_index))
+        else {
             return;
         };
-        let start_text = self.doc.text(&start_block);
-        let end_text = self.doc.text(&end_block);
+        let start_text = self.doc.text(start_block);
+        let end_text = self.doc.text(end_block);
         let start_at = clamp_char_boundary(&start_text, start.offset);
         let end_at = clamp_char_boundary(&end_text, end.offset);
 
-        if start.block == end.block {
+        if start_index == end_index {
             let mut merged = start_text;
             merged.replace_range(start_at..end_at, "");
-            self.doc.set_text(&start_block, &merged);
+            self.doc.set_text(start_block, &merged);
         } else {
             let merged = format!("{}{}", &start_text[..start_at], &end_text[end_at..]);
-            for _ in start.block + 1..=end.block {
-                self.doc.remove_block(start.block + 1);
+            // Collect the doomed ids up front: removing one block shifts the
+            // positions of the rest, so addressing by index would miss some.
+            let doomed: Vec<BlockId> = self.layouts[start_index + 1..=end_index]
+                .iter()
+                .map(|layout| layout.id)
+                .collect();
+            for id in doomed {
+                self.doc.remove_block(id);
             }
-            self.doc.set_text(&start_block, &merged);
+            self.doc.set_text(start_block, &merged);
         }
 
-        self.set_caret(Position::new(start.block, start_at));
+        self.set_caret(Position::new(start_block, start_at));
         self.layouts_dirty = true;
     }
 
@@ -183,8 +230,13 @@ impl Editor {
             return String::new();
         }
         let (start, end) = self.selection();
+        let (Some(start_index), Some(end_index)) =
+            (self.index_of(start.block), self.index_of(end.block))
+        else {
+            return String::new();
+        };
         let mut parts = Vec::new();
-        for index in start.block..=end.block {
+        for index in start_index..=end_index {
             let Some((from, to)) = self.selection_in_block(index) else {
                 continue;
             };
@@ -211,11 +263,11 @@ impl Editor {
     }
 
     pub(super) fn select_all(&mut self) {
-        let Some(last) = self.layouts.len().checked_sub(1) else {
+        let (Some(first), Some(last)) = (self.layouts.first(), self.layouts.last()) else {
             return;
         };
-        self.selection.anchor = Position::new(0, 0);
-        self.selection.focus = Position::new(last, self.layouts[last].text.len());
+        self.selection.anchor = Position::new(first.id, 0);
+        self.selection.focus = Position::new(last.id, last.text.len());
         self.selection.preferred_x = None;
     }
 

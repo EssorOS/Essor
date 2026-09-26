@@ -40,7 +40,7 @@ impl MenuItem {
 /// A transient popup: either the slash menu (filters as you type) or a block's
 /// options menu (opened from the gutter).
 pub(super) struct Menu {
-    pub(super) block: usize,
+    pub(super) block: BlockId,
     pub(super) anchor: Point,
     pub(super) items: Vec<MenuItem>,
     pub(super) selected: usize,
@@ -136,7 +136,7 @@ impl Editor {
         let mut items = MenuItem::BLOCKS.to_vec();
         items.push(MenuItem::Delete);
         self.menu = Some(Menu {
-            block: index,
+            block: block.id,
             anchor: Point::new(self.page_left, block.top),
             items,
             selected: 0,
@@ -147,14 +147,14 @@ impl Editor {
 
     pub(super) fn insert_block_below(&mut self, index: usize) {
         let at = (index + 1).min(self.doc.len());
-        let _ = self.doc.insert_block(at);
-        self.set_caret(Position::new(at, 0));
+        let block = self.doc.insert_block(at);
+        self.set_caret(Position::new(block, 0));
         self.layouts_dirty = true;
     }
 
     /// Refresh the slash query from the block text; close if the `/` is gone.
     pub(super) fn update_slash(&mut self) {
-        let Some(index) = self
+        let Some(block) = self
             .menu
             .as_ref()
             .filter(|menu| menu.slash)
@@ -162,11 +162,11 @@ impl Editor {
         else {
             return;
         };
-        let Some(block) = self.block(index) else {
+        if self.index_of(block).is_none() {
             self.menu = None;
             return;
-        };
-        let text = self.doc.text(&block);
+        }
+        let text = self.doc.text(block);
         if !text.starts_with('/') {
             self.menu = None;
             return;
@@ -249,11 +249,12 @@ impl Editor {
     }
 
     pub(super) fn strip_slash_query(&mut self, menu: &Menu) {
-        if let Some(block) = self.block(menu.block) {
-            let text = self.doc.text(&block);
+        let block = menu.block;
+        if self.index_of(block).is_some() {
+            let text = self.doc.text(block);
             if text.starts_with('/') {
-                self.doc.set_text(&block, "");
-                self.set_caret(Position::new(menu.block, 0));
+                self.doc.set_text(block, "");
+                self.set_caret(Position::new(block, 0));
             }
             self.layouts_dirty = true;
         }
@@ -266,17 +267,23 @@ impl Editor {
         match item {
             MenuItem::Delete => {
                 if self.doc.len() > 1 {
+                    let target = self
+                        .index_of(menu.block)
+                        .and_then(|index| index.checked_sub(1))
+                        .and_then(|index| self.layouts.get(index))
+                        .map(|layout| layout.id);
                     self.doc.remove_block(menu.block);
-                    let target = menu.block.saturating_sub(1);
-                    self.set_caret(Position::new(target, 0));
+                    if let Some(target) = target {
+                        self.set_caret(Position::new(target, 0));
+                    }
                 }
             }
             _ => {
                 if menu.slash {
                     self.strip_slash_query(&menu);
                 }
-                if let (Some(block), Some(kind)) = (self.block(menu.block), item.kind()) {
-                    self.doc.set_kind(&block, kind);
+                if let Some(kind) = item.kind() {
+                    self.doc.set_kind(menu.block, kind);
                 }
             }
         }
@@ -349,7 +356,7 @@ mod tests {
     #[test]
     fn slash_menu_filters_by_query() {
         let mut menu = Menu {
-            block: 0,
+            block: BlockId::default(),
             anchor: Point::ZERO,
             items: MenuItem::BLOCKS.to_vec(),
             selected: 0,
@@ -372,7 +379,7 @@ mod tests {
     #[test]
     fn row_at_maps_pointer_to_item() {
         let menu = Menu {
-            block: 0,
+            block: BlockId::default(),
             anchor: Point::new(0.0, 0.0),
             items: MenuItem::BLOCKS.to_vec(),
             selected: 0,

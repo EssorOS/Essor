@@ -1,0 +1,27 @@
+{
+  "name": "essor-sync-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Yjs websocket sync server for the Essor block editor",
+  "license": "MIT",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "smoke": "tsx scripts/smoke.ts"
+  },
+  "dependencies": {
+    "lib0": "^0.2.118",
+    "ws": "^8.18.0",
+    "y-leveldb": "^0.2.0",
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.33"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

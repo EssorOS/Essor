@@ -2,7 +2,7 @@ use super::*;
 
 impl Editor {
     pub(super) fn focus_rect(&self) -> Option<Rect> {
-        let block = self.layouts.get(self.selection.focus.block)?;
+        let block = self.layout_of(self.selection.focus.block)?;
         let cursor = block.cursor_at(self.selection.focus.offset);
         let bounds = cursor.geometry(&block.layout, block.wrap);
         Some(Rect::from_origin_size(
@@ -37,7 +37,10 @@ impl Editor {
         }
 
         let pos = self.selection.focus;
-        let Some(block) = self.layouts.get(pos.block) else {
+        let Some(index) = self.index_of(pos.block) else {
+            return;
+        };
+        let Some(block) = self.layouts.get(index) else {
             return;
         };
         let cursor = block.cursor_at(pos.offset);
@@ -55,10 +58,12 @@ impl Editor {
 
         let mut target = Position::new(pos.block, moved.index());
         if target.offset == pos.offset {
-            if dir < 0 && pos.block > 0 {
-                target = Position::new(pos.block - 1, self.layouts[pos.block - 1].text.len());
-            } else if dir > 0 && pos.block + 1 < self.layouts.len() {
-                target = Position::new(pos.block + 1, 0);
+            if dir < 0 && index > 0 {
+                let previous = &self.layouts[index - 1];
+                target = Position::new(previous.id, previous.text.len());
+            } else if dir > 0 && index + 1 < self.layouts.len() {
+                let next = &self.layouts[index + 1];
+                target = Position::new(next.id, 0);
             }
         }
         self.set_focus(target, extend);
@@ -85,7 +90,7 @@ impl Editor {
         let Some((_, y)) = self.cursor_point(pos) else {
             return;
         };
-        let Some(block) = self.layouts.get(pos.block) else {
+        let Some(block) = self.layout_of(pos.block) else {
             return;
         };
         let line = line_at_y(&block.layout, y as f32);
@@ -99,7 +104,7 @@ impl Editor {
     }
 
     pub(super) fn cursor_point(&self, pos: Position) -> Option<(f64, f64)> {
-        let block = self.layouts.get(pos.block)?;
+        let block = self.layout_of(pos.block)?;
         let cursor = block.cursor_at(pos.offset);
         let geometry = cursor.geometry(&block.layout, block.wrap);
         Some((geometry.x0, geometry.y0))
@@ -112,21 +117,22 @@ impl Editor {
         x: f64,
         y: f64,
     ) -> Option<Position> {
-        let block = self.layouts.get(pos.block)?;
+        let index = self.index_of(pos.block)?;
+        let block = self.layouts.get(index)?;
         let line = line_at_y(&block.layout, y as f32) as isize + dir;
         if line < 0 {
-            let previous = pos.block.checked_sub(1)?;
+            let previous = index.checked_sub(1)?;
             let target = &self.layouts[previous];
             let last = target.layout.len().saturating_sub(1);
             let cursor =
                 Cursor::from_point(&target.layout, x as f32, line_center(&target.layout, last));
-            Some(Position::new(previous, cursor.index()))
+            Some(Position::new(target.id, cursor.index()))
         } else if line as usize >= block.layout.len() {
-            let next = pos.block + 1;
+            let next = index + 1;
             let target = self.layouts.get(next)?;
             let cursor =
                 Cursor::from_point(&target.layout, x as f32, line_center(&target.layout, 0));
-            Some(Position::new(next, cursor.index()))
+            Some(Position::new(target.id, cursor.index()))
         } else {
             let cursor = Cursor::from_point(
                 &block.layout,

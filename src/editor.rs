@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use masonry::accesskit::{Node, Role};
@@ -20,7 +21,7 @@ use masonry::vello::Scene;
 use masonry::{TextAlign, TextAlignOptions};
 
 use crate::blink::{BLINK_INTERVAL, BlinkTimer};
-use crate::doc::{Block, BlockKind, Doc, Mark, TextRun};
+use crate::doc::{BlockId, BlockKind, Doc, Mark, TextRun};
 
 mod cursor;
 mod edit;
@@ -81,6 +82,10 @@ pub enum EditorAction {
 pub struct Editor {
     doc: Box<dyn Doc>,
     layouts: Vec<BlockLayout>,
+    /// Maps each block's stable id to its current slot in `layouts`. Rebuilt
+    /// with `layouts`, so selection and geometry address blocks by id rather
+    /// than by a position that a remote edit can shift out from under them.
+    block_index: HashMap<BlockId, usize>,
     layout_width: f32,
     page_left: f64,
     content_height: f64,
@@ -105,6 +110,7 @@ impl Editor {
         let mut editor = Self {
             doc,
             layouts: Vec::new(),
+            block_index: HashMap::new(),
             layout_width: 0.0,
             page_left: MIN_CONTENT_LEFT,
             content_height: 0.0,
@@ -146,10 +152,32 @@ impl Editor {
         self.reset_for_new_document();
     }
 
+    /// Apply an update from a sync peer. A changed document is flagged for
+    /// autosave and a full relayout on the next pass; an echo of an update the
+    /// document already has is a no-op. Returns whether anything changed. Runs
+    /// on the UI thread, which owns the document's undo manager, so the remote
+    /// edit is applied here rather than on the network worker.
+    pub fn apply_remote_update(&mut self, update: &[u8]) -> bool {
+        if !self.doc.apply_remote(update) {
+            return false;
+        }
+        self.layouts_dirty = true;
+        self.autosave();
+        self.activity();
+        true
+    }
+
+    /// The sidebar title derived straight from the document, bypassing the
+    /// layout cache. Used after a remote edit, before the relayout has run.
+    pub fn derive_document_title(&self) -> String {
+        crate::library::derive_title(&*self.doc)
+    }
+
     /// Discard all cached layout and interaction state so the current document
     /// is re-shaped and painted from scratch.
     fn reset_for_new_document(&mut self) {
         self.layouts.clear();
+        self.block_index.clear();
         self.layout_width = 0.0;
         self.content_height = 0.0;
         self.layouts_dirty = true;
@@ -220,11 +248,25 @@ impl Editor {
 
     #[cfg(test)]
     fn test_focus(&self) -> (usize, usize) {
-        (self.selection.focus.block, self.selection.focus.offset)
+        (
+            self.index_of(self.selection.focus.block).unwrap_or(0),
+            self.selection.focus.offset,
+        )
     }
 
-    fn block(&self, index: usize) -> Option<Block> {
-        self.layouts.get(index).map(|layout| layout.block.clone())
+    /// The id of the block currently laid out at `index`.
+    fn block(&self, index: usize) -> Option<BlockId> {
+        self.layouts.get(index).map(|layout| layout.id)
+    }
+
+    /// The current slot of the block with `id`, if it is laid out.
+    fn index_of(&self, id: BlockId) -> Option<usize> {
+        self.block_index.get(&id).copied()
+    }
+
+    /// The cached layout of the block with `id`, if it is laid out.
+    fn layout_of(&self, id: BlockId) -> Option<&BlockLayout> {
+        self.index_of(id).and_then(|index| self.layouts.get(index))
     }
 
     /// Flush pending content changes: rebuild layouts, request a relayout, and
@@ -436,6 +478,7 @@ mod tests {
     use masonry::core::{NewWidget, WidgetTag};
     use masonry::theme::default_property_set;
     use masonry_testing::TestHarness;
+    use yrs::{ReadTxn, StateVector, Transact};
 
     #[test]
     fn click_places_caret() {
@@ -444,8 +487,8 @@ mod tests {
         const EDITOR_TAG: WidgetTag<Editor> = WidgetTag::new("editor");
 
         let doc = crate::doc::YrsDocument::new();
-        let block = doc.snapshot().remove(0).block;
-        doc.set_text(&block, "hello world");
+        let block = doc.snapshot().remove(0).id;
+        doc.set_text(block, "hello world");
 
         let mut harness = TestHarness::create_with_size(
             default_property_set(),
@@ -501,8 +544,8 @@ mod tests {
         const EDITOR_TAG: WidgetTag<Editor> = WidgetTag::new("editor");
 
         let doc = crate::doc::YrsDocument::new();
-        let block = doc.snapshot().remove(0).block;
-        doc.set_text(&block, "Hello world\nmore text");
+        let block = doc.snapshot().remove(0).id;
+        doc.set_text(block, "Hello world\nmore text");
         let expected = crate::library::derive_title(&doc);
 
         let harness = TestHarness::create_with_size(
@@ -518,12 +561,64 @@ mod tests {
     }
 
     #[test]
+    fn typing_into_an_empty_document_seeds_a_block() {
+        const EDITOR_TAG: WidgetTag<Editor> = WidgetTag::new("editor");
+
+        let doc = crate::doc::YrsDocument::new();
+        doc.remove_block(doc.snapshot()[0].id);
+        assert!(doc.is_empty());
+
+        let mut harness = TestHarness::create_with_size(
+            default_property_set(),
+            NewWidget::new_with_tag(
+                Editor::new(Box::new(doc), BlinkTimer::disabled()),
+                EDITOR_TAG,
+            ),
+            Size::new(800.0, 600.0),
+        );
+
+        harness.edit_widget(EDITOR_TAG, |mut editor| {
+            editor.widget.insert_text("hello");
+            editor.ctx.request_layout();
+        });
+
+        let editor = harness.get_widget(EDITOR_TAG);
+        assert!(!editor.doc.is_empty(), "empty document still has no blocks");
+        assert_eq!(editor.doc.text(editor.block(0).unwrap()), "hello");
+    }
+
+    #[test]
+    fn splitting_an_empty_document_seeds_then_splits() {
+        const EDITOR_TAG: WidgetTag<Editor> = WidgetTag::new("editor");
+
+        let doc = crate::doc::YrsDocument::new();
+        doc.remove_block(doc.snapshot()[0].id);
+        assert!(doc.is_empty());
+
+        let mut harness = TestHarness::create_with_size(
+            default_property_set(),
+            NewWidget::new_with_tag(
+                Editor::new(Box::new(doc), BlinkTimer::disabled()),
+                EDITOR_TAG,
+            ),
+            Size::new(800.0, 600.0),
+        );
+
+        harness.edit_widget(EDITOR_TAG, |mut editor| {
+            editor.widget.split();
+            editor.ctx.request_layout();
+        });
+
+        assert_eq!(harness.get_widget(EDITOR_TAG).doc.len(), 2);
+    }
+
+    #[test]
     fn load_document_swaps_content_and_resets_state() {
         const EDITOR_TAG: WidgetTag<Editor> = WidgetTag::new("editor");
 
         let doc = crate::doc::YrsDocument::new();
-        let block = doc.snapshot().remove(0).block;
-        doc.set_text(&block, "first document");
+        let block = doc.snapshot().remove(0).id;
+        doc.set_text(block, "first document");
 
         let mut harness = TestHarness::create_with_size(
             default_property_set(),
@@ -535,8 +630,8 @@ mod tests {
         );
 
         let second = crate::doc::YrsDocument::new();
-        let block = second.snapshot().remove(0).block;
-        second.set_text(&block, "second document");
+        let block = second.snapshot().remove(0).id;
+        second.set_text(block, "second document");
         second.insert_block(1);
 
         harness.edit_widget(EDITOR_TAG, |mut editor| {
@@ -557,8 +652,8 @@ mod tests {
         const PORTAL_TAG: WidgetTag<Portal<Editor>> = WidgetTag::new("editor-portal");
 
         let doc = crate::doc::YrsDocument::new();
-        let block = doc.snapshot().remove(0).block;
-        doc.set_text(&block, "short document");
+        let block = doc.snapshot().remove(0).id;
+        doc.set_text(block, "short document");
 
         let editor = Editor::new(Box::new(doc), BlinkTimer::disabled());
         let portal = Portal::new(NewWidget::new_with_tag(editor, EDITOR_TAG));
@@ -596,7 +691,7 @@ mod tests {
         let doc = crate::doc::YrsDocument::new();
         for b in 1..30 {
             let block = doc.insert_block(b);
-            doc.set_text(&block, "some text that could wrap at a narrow width");
+            doc.set_text(block, "some text that could wrap at a narrow width");
         }
 
         let mut harness = TestHarness::create_with_size(
@@ -622,5 +717,105 @@ mod tests {
         let editor = harness.get_widget(EDITOR_TAG);
         assert!(editor.reflow.pending().is_none(), "reflow was not applied");
         assert_ne!(editor.layout_width, width_before, "width was not re-shaped");
+    }
+
+    /// A peer update that changes `doc` by applying `change` to an independent
+    /// replica seeded with `doc`'s state. Block ids are shared, so the change
+    /// targets the same blocks the editor sees.
+    fn peer_update(
+        doc: &crate::doc::YrsDocument,
+        change: impl FnOnce(&crate::doc::YrsDocument),
+    ) -> Vec<u8> {
+        let peer = crate::doc::YrsDocument::new();
+        // Drop the peer's own seed so the diff carries only our change.
+        peer.remove_block(peer.snapshot()[0].id);
+        let state = doc
+            .handle()
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        peer.apply_remote(&state);
+        change(&peer);
+        let sv = doc.handle().transact().state_vector();
+        peer.handle().transact().encode_state_as_update_v1(&sv)
+    }
+
+    #[test]
+    fn remote_insert_above_keeps_the_caret_on_its_block() {
+        use masonry::core::WindowEvent;
+        use masonry::dpi::PhysicalSize;
+
+        const EDITOR_TAG: WidgetTag<Editor> = WidgetTag::new("editor");
+
+        let doc = crate::doc::YrsDocument::new();
+        let second = doc.insert_block(1);
+        doc.set_text(second, "second");
+        let update = peer_update(&doc, |peer| {
+            peer.insert_block(0);
+        });
+
+        let mut harness = TestHarness::create_with_size(
+            default_property_set(),
+            NewWidget::new_with_tag(
+                Editor::new(Box::new(doc), BlinkTimer::disabled()),
+                EDITOR_TAG,
+            ),
+            Size::new(800.0, 600.0),
+        );
+
+        harness.edit_widget(EDITOR_TAG, |mut editor| {
+            editor.widget.set_caret(Position::new(second, 3));
+            editor.widget.apply_remote_update(&update);
+            editor.ctx.request_layout();
+        });
+        // Run the requested layout pass so the cache and selection re-anchor.
+        harness.process_window_event(WindowEvent::Resize(PhysicalSize::new(800, 600)));
+
+        let editor = harness.get_widget(EDITOR_TAG);
+        assert_eq!(
+            editor.selection.focus.block, second,
+            "a remote insert retargeted the caret to another block"
+        );
+        assert_eq!(editor.selection.focus.offset, 3);
+        assert_eq!(editor.index_of(second), Some(2), "block did not shift down");
+    }
+
+    #[test]
+    fn remote_delete_of_the_selected_block_snaps_to_a_neighbor() {
+        use masonry::core::WindowEvent;
+        use masonry::dpi::PhysicalSize;
+
+        const EDITOR_TAG: WidgetTag<Editor> = WidgetTag::new("editor");
+
+        let doc = crate::doc::YrsDocument::new();
+        let second = doc.insert_block(1);
+        doc.set_text(second, "second");
+        let update = peer_update(&doc, |peer| {
+            peer.remove_block(second);
+        });
+
+        let mut harness = TestHarness::create_with_size(
+            default_property_set(),
+            NewWidget::new_with_tag(
+                Editor::new(Box::new(doc), BlinkTimer::disabled()),
+                EDITOR_TAG,
+            ),
+            Size::new(800.0, 600.0),
+        );
+
+        harness.edit_widget(EDITOR_TAG, |mut editor| {
+            editor.widget.set_caret(Position::new(second, 0));
+            editor.widget.apply_remote_update(&update);
+            editor.ctx.request_layout();
+        });
+        harness.process_window_event(WindowEvent::Resize(PhysicalSize::new(800, 600)));
+
+        let editor = harness.get_widget(EDITOR_TAG);
+        assert_ne!(editor.selection.focus.block, second);
+        assert_eq!(editor.selection.focus.offset, 0);
+        assert_eq!(
+            editor.index_of(editor.selection.focus.block),
+            Some(0),
+            "caret did not snap to the surviving neighbor"
+        );
     }
 }

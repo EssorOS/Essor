@@ -55,19 +55,45 @@ logging (for example `RUST_LOG=warn` or `RUST_LOG=debug`).
 
 ## Where documents are stored
 
-Each page is saved as its own Yjs update file, with the ordered list and active
-page in an index:
+Each page is saved as its own Yjs update file. The page list — which pages
+exist, their titles, and their order — is itself a Yjs document, persisted
+alongside them:
 
 ```
-<data dir>/essor/documents.json
+<data dir>/essor/library.ydoc
 <data dir>/essor/documents/<id>.ydoc
 ```
 
 On macOS that is typically under
 `~/Library/Application Support/essor/`. Delete the directory to start over.
 
-An older single-document `essor.ydoc` is migrated into the list automatically
-on first launch.
+## Real-time sync
+
+Essor can sync documents live through a small Node/TypeScript websocket server
+that speaks the standard Yjs protocol. The sidebar list — which pages exist,
+their titles, and their order — is synced through a shared `library` room, and
+each page's content is synced through a room named after its id. Only the active
+page holds a content connection.
+
+Start the server:
+
+```sh
+cd server
+npm install
+npm run dev
+```
+
+Then point the editor at it:
+
+```sh
+ESSOR_SYNC_URL=ws://127.0.0.1:1234 cargo run --release
+```
+
+With `ESSOR_SYNC_URL` unset the editor runs fully offline. Connections retry
+automatically with backoff if the server restarts, and edits made while
+disconnected are reconciled on reconnect. The server persists documents to
+LevelDB under `server/data`; see [server/README.md](server/README.md) for
+configuration and a smoke test.
 
 ## Keyboard and mouse
 
@@ -116,7 +142,11 @@ The editor widget is split into focused modules under `src/editor/`:
 | `theme.rs` | Colors, metrics, and layout constants |
 
 `src/blink.rs` owns the caret-blink timer thread, and `src/main.rs` wires the
-widget into a `masonry_winit` window.
+widget into a `masonry_winit` window. `src/net/` owns the background websocket
+sync client: it shares a `yrs` document with a worker thread, forwards local
+edits to the server and relays remote edits back to the UI. `src/session.rs`
+orchestrates the connections — the shared page list and the active page — and
+`src/library.rs` owns the catalog and the local `.ydoc` files.
 
 ## License
 

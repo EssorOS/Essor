@@ -126,7 +126,7 @@ impl Editor {
             );
 
             if focused
-                && index == caret_block
+                && block.id == caret_block
                 && block.text.is_empty()
                 && block.kind != BlockKind::Bullet
             {
@@ -150,7 +150,7 @@ impl Editor {
                 );
             }
 
-            if focused && self.caret_visible && index == caret_block {
+            if focused && self.caret_visible && block.id == caret_block {
                 let cursor = block.cursor_at(caret_offset);
                 let bounds = cursor.geometry(&block.layout, block_width);
                 let rect = Rect::from_origin_size(
@@ -176,8 +176,7 @@ impl Editor {
             return;
         };
         let font_size = self
-            .layouts
-            .get(self.selection.focus.block)
+            .layout_of(self.selection.focus.block)
             .map_or(DEFAULT_FONT_SIZE, |block| block.kind.font_size());
         let builder = base_builder(font_cx, layout_cx, &self.preedit, font_size);
         let mut layout = builder.build(&self.preedit);

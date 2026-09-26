@@ -44,23 +44,26 @@ const SHADOW: Color = Color::from_rgba8(0x0f, 0x0f, 0x0f, 0x14);
 /// A document row rendered in the sidebar.
 #[derive(Clone, Debug)]
 pub struct SidebarEntry {
+    pub id: String,
     pub title: String,
 }
 
 impl From<&DocumentMeta> for SidebarEntry {
     fn from(meta: &DocumentMeta) -> Self {
         Self {
+            id: meta.id.clone(),
             title: meta.title.clone(),
         }
     }
 }
 
-/// Actions the sidebar asks the application to perform.
+/// Actions the sidebar asks the application to perform. They carry page ids, not
+/// indices, so a concurrent library change can't make them target the wrong row.
 #[derive(Debug)]
 pub enum SidebarAction {
     Create,
-    Select(usize),
-    Delete(usize),
+    Select(String),
+    Delete(String),
 }
 
 /// A shaped, elided title for one row. Cached across layouts and repaints so a
@@ -124,8 +127,8 @@ impl Sidebar {
     /// Update one row's title in place, re-shaping only that row on the next
     /// layout pass. Invalidation is implicit: the changed `entry.title` no longer
     /// matches the cached `row.source`, so `layout` rebuilds just this row.
-    pub fn set_title(this: &mut WidgetMut<'_, Self>, index: usize, title: String) {
-        let Some(entry) = this.widget.entries.get_mut(index) else {
+    pub fn set_title(this: &mut WidgetMut<'_, Self>, id: &str, title: String) {
+        let Some(entry) = this.widget.entries.iter_mut().find(|entry| entry.id == id) else {
             return;
         };
         if entry.title == title {
@@ -187,7 +190,9 @@ impl Sidebar {
             let (cancel, delete) = Self::confirm_buttons(rect);
             if delete.contains(point) {
                 self.confirm = None;
-                ctx.submit_action::<SidebarAction>(SidebarAction::Delete(index));
+                if let Some(id) = self.entries.get(index).map(|entry| entry.id.clone()) {
+                    ctx.submit_action::<SidebarAction>(SidebarAction::Delete(id));
+                }
                 ctx.set_handled();
                 ctx.request_render();
             } else if cancel.contains(point) || !rect.contains(point) {
@@ -210,7 +215,9 @@ impl Sidebar {
                 ctx.request_render();
                 return;
             }
-            ctx.submit_action::<SidebarAction>(SidebarAction::Select(index));
+            if let Some(id) = self.entries.get(index).map(|entry| entry.id.clone()) {
+                ctx.submit_action::<SidebarAction>(SidebarAction::Select(id));
+            }
             ctx.set_handled();
             ctx.request_render();
         }
@@ -542,9 +549,11 @@ mod tests {
     fn harness() -> TestHarness<Sidebar> {
         let entries = vec![
             SidebarEntry {
+                id: "first".into(),
                 title: "First".into(),
             },
             SidebarEntry {
+                id: "second".into(),
                 title: "Second".into(),
             },
         ];
@@ -558,6 +567,7 @@ mod tests {
     #[test]
     fn long_titles_are_elided_to_fit() {
         let entries = vec![SidebarEntry {
+            id: "long".into(),
             title: "Longest document title ".repeat(20),
         }];
         let harness = TestHarness::create_with_size(
@@ -589,7 +599,7 @@ mod tests {
         harness.mouse_button_press(PointerButton::Primary);
         harness.mouse_button_release(PointerButton::Primary);
         let action = harness.pop_action::<SidebarAction>();
-        assert!(matches!(action, Some((SidebarAction::Select(0), _))));
+        assert!(matches!(action, Some((SidebarAction::Select(id), _)) if id == "first"));
     }
 
     #[test]
@@ -614,6 +624,6 @@ mod tests {
         harness.mouse_button_press(PointerButton::Primary);
         harness.mouse_button_release(PointerButton::Primary);
         let action = harness.pop_action::<SidebarAction>();
-        assert!(matches!(action, Some((SidebarAction::Delete(0), _))));
+        assert!(matches!(action, Some((SidebarAction::Delete(id), _)) if id == "first"));
     }
 }

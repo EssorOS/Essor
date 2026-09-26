@@ -3,9 +3,15 @@ mod doc;
 mod editor;
 mod fs;
 mod library;
+mod net;
+mod session;
 mod sidebar;
 
+#[cfg(test)]
+mod test_support;
+
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use masonry::core::{
     ErasedAction, FromDynWidget, NewWidget, Widget, WidgetId, WidgetMut, WidgetTag,
@@ -23,6 +29,7 @@ use masonry_winit::winit::window::Window;
 use crate::blink::BlinkTimer;
 use crate::editor::{Editor, EditorAction};
 use crate::library::Library;
+use crate::session::{Notify, Signal, SyncSession};
 use crate::sidebar::{Sidebar, SidebarAction, SidebarEntry};
 
 const EDITOR_TAG: WidgetTag<Editor> = WidgetTag::new("editor");
@@ -116,6 +123,8 @@ struct Driver {
     window_id: WindowId,
     resizable_configured: bool,
     library: Library,
+    /// Shared-list and active-page sync, or an inert session when offline.
+    session: SyncSession,
 }
 
 impl Driver {
@@ -138,13 +147,6 @@ impl Driver {
         with_widget(ctx, self.window_id, PORTAL_TAG, f);
     }
 
-    /// The editor's current sidebar title, if the editor exists.
-    fn editor_title(&self, ctx: &mut DriverCtx<'_, '_>) -> Option<String> {
-        ctx.render_root(self.window_id)
-            .get_widget_with_tag(EDITOR_TAG)
-            .map(|editor| editor.title())
-    }
-
     /// The editor's widget id, if it exists.
     fn editor_id(&self, ctx: &mut DriverCtx<'_, '_>) -> Option<WidgetId> {
         ctx.render_root(self.window_id)
@@ -160,15 +162,21 @@ impl Driver {
             .iter()
             .map(SidebarEntry::from)
             .collect();
-        let active = self.library.active();
+        let active = self.library.active_index();
         self.with_sidebar(ctx, |mut sidebar| {
             Sidebar::set_entries(&mut sidebar, entries, active);
         });
     }
 
     /// Load the active library document into the editor.
-    fn load_active(&self, ctx: &mut DriverCtx<'_, '_>) {
-        let doc = self.library.open_document(self.library.active());
+    fn load_active(&mut self, ctx: &mut DriverCtx<'_, '_>) {
+        let Some(id) = self.library.active_id() else {
+            return;
+        };
+        let Some(doc) = self.library.open_document(&id) else {
+            return;
+        };
+        self.session.connect_document(doc.handle(), id);
         self.with_editor(ctx, |mut editor| {
             editor.widget.load_document(Box::new(doc));
             editor.ctx.request_layout();
@@ -187,30 +195,77 @@ impl Driver {
         ctx.render_root(self.window_id).focus_on(id);
     }
 
-    /// Persist the index and refresh the sidebar and focus after a library change.
+    /// Persist the catalog and refresh the sidebar and focus after a change.
     fn after_library_change(&mut self, ctx: &mut DriverCtx<'_, '_>) {
-        self.library.save_index();
+        self.library.save();
         self.sync_sidebar(ctx);
         self.focus_editor(ctx);
     }
 
-    /// Keep the sidebar title in sync with the active document as it is edited.
+    /// Keep the sidebar title in sync with the active document as it is edited,
+    /// reading the cached layout.
     fn sync_title(&mut self, ctx: &mut DriverCtx<'_, '_>) {
-        let Some(title) = self.editor_title(ctx) else {
+        self.sync_title_with(ctx, Editor::title);
+    }
+
+    /// Like [`Self::sync_title`], but derives the title straight from the CRDT.
+    /// Needed after a remote edit, before the relayout it schedules has run.
+    fn sync_title_from_document(&mut self, ctx: &mut DriverCtx<'_, '_>) {
+        self.sync_title_with(ctx, Editor::derive_document_title);
+    }
+
+    fn sync_title_with(&mut self, ctx: &mut DriverCtx<'_, '_>, read: impl Fn(&Editor) -> String) {
+        let title = ctx
+            .render_root(self.window_id)
+            .get_widget_with_tag(EDITOR_TAG)
+            .map(|editor| read(&editor));
+        if let Some(title) = title {
+            self.apply_active_title(ctx, title);
+        }
+    }
+
+    /// Cache `title` for the active document, publishing it to the shared list
+    /// and sidebar if it changed.
+    fn apply_active_title(&mut self, ctx: &mut DriverCtx<'_, '_>, title: String) {
+        let Some(id) = self.library.active_id() else {
             return;
         };
-        let active = self.library.active();
         let stale = self
             .library
             .entries()
-            .get(active)
+            .iter()
+            .find(|meta| meta.id == id)
             .map(|meta| meta.title.as_str())
             != Some(title.as_str());
-        if stale {
-            self.library.set_title(active, title.clone());
-            self.with_sidebar(ctx, |mut sidebar| {
-                Sidebar::set_title(&mut sidebar, active, title);
-            });
+        if !stale {
+            return;
+        }
+        self.library.set_title(&id, &title);
+        self.library.save();
+        self.with_sidebar(ctx, |mut sidebar| {
+            Sidebar::set_title(&mut sidebar, &id, title);
+        });
+    }
+
+    /// Pull the shared catalog in, mirroring it to page files, and react to any
+    /// change: a page may have appeared, vanished, or been renamed remotely.
+    fn refresh_library(&mut self, ctx: &mut DriverCtx<'_, '_>) {
+        let before = self.library.active_id();
+        self.library.sync_files();
+        // A peer could have removed the last page; never leave the library
+        // empty, since the sidebar and editor both assume one page.
+        if self.library.entries().is_empty() {
+            self.library.create();
+        }
+        if self.library.active_id().is_none()
+            && let Some(first) = self.library.entries().first()
+        {
+            self.library.set_active_id(&first.id);
+        }
+        self.library.save();
+        self.sync_sidebar(ctx);
+        if self.library.active_id() != before {
+            self.load_active(ctx);
         }
     }
 }
@@ -239,6 +294,30 @@ impl AppDriver for Driver {
             return;
         }
 
+        if let Some(signal) = action.downcast_ref::<Signal>() {
+            match signal {
+                Signal::RemoteUpdate { room, update } => {
+                    // Ignore edits for a page we have since navigated away from.
+                    if self.library.active_id().as_deref() == Some(room.as_str()) {
+                        let mut changed = false;
+                        self.with_editor(ctx, |mut editor| {
+                            changed = editor.widget.apply_remote_update(update);
+                            if changed {
+                                editor.ctx.request_layout();
+                            }
+                        });
+                        // An unchanged update is the server echoing our own edit
+                        // back; the title already reflects it.
+                        if changed {
+                            self.sync_title_from_document(ctx);
+                        }
+                    }
+                }
+                Signal::LibraryChanged => self.refresh_library(ctx),
+            }
+            return;
+        }
+
         let Some(sidebar_action) = action.downcast_ref::<SidebarAction>() else {
             return;
         };
@@ -250,16 +329,16 @@ impl AppDriver for Driver {
                 self.load_active(ctx);
                 self.after_library_change(ctx);
             }
-            SidebarAction::Select(index) => {
+            SidebarAction::Select(id) => {
                 self.sync_title(ctx);
-                self.library.set_active(*index);
+                self.library.set_active_id(id);
                 self.load_active(ctx);
                 self.after_library_change(ctx);
             }
-            SidebarAction::Delete(index) => {
+            SidebarAction::Delete(id) => {
                 self.sync_title(ctx);
-                let was_active = self.library.active() == *index;
-                if self.library.delete(*index) {
+                let was_active = self.library.active_id().as_deref() == Some(id.as_str());
+                if self.library.delete(id) {
                     if was_active {
                         self.load_active(ctx);
                     }
@@ -272,7 +351,8 @@ impl AppDriver for Driver {
     fn on_close_requested(&mut self, window_id: WindowId, ctx: &mut DriverCtx<'_, '_>) {
         debug_assert_eq!(window_id, self.window_id, "unknown window");
         self.sync_title(ctx);
-        self.library.save_index();
+        self.library.save();
+        self.session.disconnect();
         ctx.exit();
     }
 }
@@ -288,6 +368,7 @@ fn main() {
 
     let event_loop = EventLoop::with_user_event().build().unwrap();
     let proxy = event_loop.create_proxy();
+    let sync_proxy = proxy.clone();
     let window_id = WindowId::next();
 
     // Timer thread: sleeps `BLINK_INTERVAL`; if the editor reports activity in the
@@ -297,12 +378,39 @@ fn main() {
         proxy.send_event(event).is_ok()
     });
 
-    let library = Library::open(data_dir());
-    let active = library.active();
-    let entries: Vec<SidebarEntry> = library.entries().iter().map(SidebarEntry::from).collect();
-    let document = Box::new(library.open_document(active));
+    // Optional real-time sync. Without `ESSOR_SYNC_URL` the app runs offline.
+    let sync_url = std::env::var("ESSOR_SYNC_URL")
+        .ok()
+        .filter(|url| !url.is_empty());
 
-    let editor = Editor::new(document, blink);
+    let mut library = Library::open(data_dir());
+
+    let notify: Notify = {
+        let proxy = sync_proxy.clone();
+        Arc::new(move |signal| {
+            let action: ErasedAction = Box::new(signal);
+            let event = MasonryUserEvent::Action(window_id, action, WidgetId::next());
+            let _ = proxy.send_event(event);
+        })
+    };
+    let catalog = library.catalog_handle();
+    let catalog_dirty = library.catalog_dirty();
+    let mut session = SyncSession::start(sync_url, notify, catalog, catalog_dirty, &mut library);
+    // Mirror the catalog to page files and persist it, then open the active page.
+    library.sync_files();
+    library.save();
+
+    let active_id = library
+        .active_id()
+        .expect("library is seeded with at least one page");
+    let entries: Vec<SidebarEntry> = library.entries().iter().map(SidebarEntry::from).collect();
+    let active = library.active_index();
+    let document = library
+        .open_document(&active_id)
+        .expect("the active page has a file");
+    session.connect_document(document.handle(), active_id);
+
+    let editor = Editor::new(Box::new(document), blink);
     let sidebar = Sidebar::new(entries, active);
     let portal = Portal::new(NewWidget::new_with_tag(editor, EDITOR_TAG));
 
@@ -320,6 +428,7 @@ fn main() {
         window_id,
         resizable_configured: false,
         library,
+        session,
     };
 
     run_with(

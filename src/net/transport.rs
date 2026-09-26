@@ -26,18 +26,17 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 pub(super) type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 /// Open a connection, retrying with exponential backoff until one succeeds or
-/// the worker is told to shut down. Edits queued while waiting are discarded:
-/// they already live in the shared document and are replayed by the handshake
-/// on reconnect.
+/// the worker is told to shut down. Frames queued while waiting are collected in
+/// `deferred` and sent once a connection is up, rather than discarded.
 pub(super) fn connect_with_backoff(
     url: &str,
     receiver: &Receiver<Bridge>,
     backoff: &mut Duration,
+    deferred: &mut Vec<Vec<u8>>,
 ) -> Option<Socket> {
     loop {
-        match connect_bounded(url) {
-            Ok(socket) => return Some(socket),
-            Err(error) => tracing::debug!(%error, %url, "sync: connect failed"),
+        if let Ok(socket) = connect_bounded(url) {
+            return Some(socket);
         }
 
         let deadline = Instant::now() + *backoff;
@@ -49,7 +48,7 @@ pub(super) fn connect_with_backoff(
             }
             match receiver.recv_timeout(remaining) {
                 Ok(Bridge::Shutdown) | Err(RecvTimeoutError::Disconnected) => return None,
-                Ok(_) => {}
+                Ok(Bridge::Outbound(bytes)) => deferred.push(bytes),
                 Err(RecvTimeoutError::Timeout) => break,
             }
         }

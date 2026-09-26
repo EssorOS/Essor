@@ -12,12 +12,15 @@ masonry_winit = "0.4.0"
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
 objc2-quartz-core = "0.3.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 tungstenite = "0.30"
 unicode-segmentation = "1.13.3"
 uuid = { version = "1", features = ["v4"] }
-yrs = { version = "0.28", features = ["sync"] }
 
 [dev-dependencies]
 masonry_testing = "0.4.0"

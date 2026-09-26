@@ -1,1 +1,4 @@
 /target
+/server/node_modules
+/server/dist
+/server/data

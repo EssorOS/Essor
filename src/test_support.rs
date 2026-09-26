@@ -88,24 +88,6 @@ impl TestServer {
         format!("ws://127.0.0.1:{}", self.port)
     }
 
-    /// Stop the server, keeping the data directory intact for [`Self::restart`].
-    pub(crate) fn stop(&mut self) {
-        self.child = None;
-    }
-
-    /// Start a fresh server on the same port and data directory.
-    pub(crate) fn restart(&mut self) {
-        self.spawn();
-    }
-
-    /// Stop the server, erase its data directory, and start a fresh instance on
-    /// the same port. Simulates a server whose persistence was lost.
-    pub(crate) fn wipe(&mut self) {
-        self.child = None;
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-        self.spawn();
-    }
-
     fn spawn(&mut self) {
         self.child = Some(Server::spawn(self.port, &self.data_dir));
         assert!(

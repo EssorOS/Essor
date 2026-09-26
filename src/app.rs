@@ -9,11 +9,10 @@ use masonry::kurbo::Point;
 use masonry::widgets::Portal;
 use masonry_winit::app::{AppDriver, DriverCtx, WindowId};
 
-use crate::doc::RemoteUpdate;
 use crate::editor::{Editor, EditorAction};
 use crate::library::Library;
 use crate::platform;
-use crate::session::{Signal, SyncSession};
+use crate::session::{Inbound, Signal, SyncSession};
 use crate::sidebar::{Sidebar, SidebarAction, SidebarEntry};
 use crate::{EDITOR_TAG, PORTAL_TAG, SIDEBAR_TAG};
 
@@ -106,7 +105,6 @@ impl Driver {
         let Some(doc) = self.library.open_document(&id) else {
             return;
         };
-        self.session.connect_document(doc.handle(), id);
         self.with_editor(ctx, |mut editor| {
             editor.widget.load_document(Box::new(doc));
             editor.ctx.request_layout();
@@ -125,9 +123,10 @@ impl Driver {
         ctx.render_root(self.window_id).focus_on(id);
     }
 
-    /// Persist the catalog and refresh the sidebar and focus after a change.
+    /// Flush local changes to sync, refresh the sidebar, and refocus after a
+    /// library change.
     fn after_library_change(&mut self, ctx: &mut DriverCtx<'_, '_>) {
-        self.library.save();
+        self.session.flush(&self.library);
         self.sync_sidebar(ctx);
         self.focus_editor(ctx);
     }
@@ -171,28 +170,21 @@ impl Driver {
             return;
         }
         self.library.set_title(&id, &title);
-        self.library.save();
+        self.session.flush(&self.library);
         self.with_sidebar(ctx, |mut sidebar| {
             Sidebar::set_title(&mut sidebar, &id, title);
         });
     }
 
-    /// Pull the shared catalog in, mirroring it to page files, and react to any
-    /// change: a page may have appeared, vanished, or been renamed remotely.
+    /// Pull the shared catalog in and react to any change: a page may have
+    /// appeared, vanished, or been renamed remotely.
     fn refresh_library(&mut self, ctx: &mut DriverCtx<'_, '_>) {
         let before = self.library.active_id();
-        self.library.sync_files();
-        // A peer could have removed the last page; never leave the library
-        // empty, since the sidebar and editor both assume one page.
-        if self.library.entries().is_empty() {
-            self.library.create();
-        }
         if self.library.active_id().is_none()
-            && let Some(first) = self.library.entries().first()
+            && let Some(first) = self.library.entries().first().map(|meta| meta.id.clone())
         {
-            self.library.set_active_id(&first.id);
+            self.library.set_active_id(&first);
         }
-        self.library.save();
         self.sync_sidebar(ctx);
         if self.library.active_id() != before {
             self.load_active(ctx);
@@ -221,29 +213,37 @@ impl AppDriver for Driver {
 
         if action.is::<EditorAction>() {
             self.sync_title(ctx);
+            self.session.flush(&self.library);
             return;
         }
 
         if let Some(signal) = action.downcast_ref::<Signal>() {
             match signal {
-                Signal::RemoteUpdate { room, update } => {
-                    // Ignore edits for a page we have since navigated away from.
-                    if self.library.active_id().as_deref() == Some(room.as_str()) {
-                        let mut changed = false;
-                        self.with_editor(ctx, |mut editor| {
-                            changed = editor.widget.apply_remote_update(RemoteUpdate::new(update));
-                            if changed {
-                                editor.ctx.request_layout();
+                Signal::Connected => self.session.hello(&self.library),
+                Signal::Message(bytes) => {
+                    let inbound = self.session.handle(bytes, &mut self.library);
+                    match inbound {
+                        Inbound::Handshake => self.refresh_library(ctx),
+                        Inbound::Records(pages) => {
+                            match self.library.active_id() {
+                                Some(active) => {
+                                    // Only relayout when the active page changed;
+                                    // edits to other pages just update the sidebar.
+                                    if pages.iter().any(|page| page == &active) {
+                                        self.with_editor(ctx, |mut editor| {
+                                            editor.widget.refresh();
+                                            editor.ctx.request_layout();
+                                            editor.ctx.request_render();
+                                        });
+                                        self.sync_title_from_document(ctx);
+                                    }
+                                    self.sync_sidebar(ctx);
+                                }
+                                None => self.refresh_library(ctx),
                             }
-                        });
-                        // An unchanged update is the server echoing our own edit
-                        // back; the title already reflects it.
-                        if changed {
-                            self.sync_title_from_document(ctx);
                         }
                     }
                 }
-                Signal::LibraryChanged => self.refresh_library(ctx),
             }
             return;
         }
@@ -281,7 +281,6 @@ impl AppDriver for Driver {
     fn on_close_requested(&mut self, window_id: WindowId, ctx: &mut DriverCtx<'_, '_>) {
         debug_assert_eq!(window_id, self.window_id, "unknown window");
         self.sync_title(ctx);
-        self.library.save();
         self.session.disconnect();
         ctx.exit();
     }

@@ -4,8 +4,8 @@ A small, fast, block-based text editor written in Rust. Essor owns its own
 document model and editing semantics, and renders text directly on the GPU.
 
 Each paragraph is a *block* that can be a paragraph, a heading, or a bullet
-list item. Content is stored in a CRDT, so the document format is ready for
-real-time collaboration and undo/redo without a custom history layer.
+list item. Blocks are records in a last-write-wins store, merged per block, so
+the document format supports real-time collaboration and undo/redo.
 
 ## Features
 
@@ -15,20 +15,20 @@ real-time collaboration and undo/redo without a custom history layer.
 - **Slash menu** — type `/` to open a filterable command menu.
 - **Gutter menu** — hover a block to insert a new block below (`+`) or change
   its kind / delete it (`⋮`).
-- **Inline marks** — bold and italic over arbitrary ranges.
+- **Inline marks** — bold and italic over arbitrary ranges, preserved across
+  edits.
 - **Rich text editing** — word/line-aware selection, grapheme-correct caret
   motion (combining marks, emoji ZWJ sequences), IME composition, and
   clipboard cut/copy/paste.
 - **Document sidebar** — create new pages, switch between them, and delete
   them (with confirmation) from a list down the left edge.
-- **Undo / redo** driven by the CRDT's undo manager.
-- **Autosave** — each document is persisted to its own `.ydoc` file after every
-  edit, with the page list tracked in a small JSON index.
+- **Undo / redo** — scoped to your own edits, so it never clobbers a peer.
+- **Autosave** — every edit is written to a local SQLite database.
 - **GPU rendering** — text is shaped with Parley and painted with Vello.
 
 ## Requirements
 
-- Rust with support for the 2024 edition (Rust 1.85+).
+- Rust 1.89+ (the 2024 edition, plus `File::try_lock` for the data-dir lock).
 - Developed and tested on macOS. Non-macOS builds are expected to work; the
   macOS-specific window-resize fix is compiled out elsewhere.
 
@@ -55,25 +55,41 @@ logging (for example `RUST_LOG=warn` or `RUST_LOG=debug`).
 
 ## Where documents are stored
 
-Each page is saved as its own Yjs update file. The page list — which pages
-exist, their titles, and their order — is itself a Yjs document, persisted
-alongside them:
+All pages live in one SQLite database:
 
 ```
-<data dir>/essor/library.ydoc
-<data dir>/essor/documents/<id>.ydoc
+<data dir>/essor/essor.db
 ```
 
-On macOS that is typically under
-`~/Library/Application Support/essor/`. Delete the directory to start over.
+On macOS that is typically under `~/Library/Application Support/essor/`. Delete
+the directory to start over.
+
+Only one instance can use a data directory at a time. To run a second instance
+(for example to test sync locally), point it at its own directory:
+
+```sh
+ESSOR_DATA_DIR=$(mktemp -d) cargo run --release
+```
+
+A second instance started without `ESSOR_DATA_DIR` exits with an error, because
+two processes sharing one database would also share a client id and break
+last-write-wins.
 
 ## Real-time sync
 
-Essor can sync documents live through a small Node/TypeScript websocket server
-that speaks the standard Yjs protocol. The sidebar list — which pages exist,
-their titles, and their order — is synced through a shared `library` room, and
-each page's content is synced through a room named after its id. Only the active
-page holds a content connection.
+Essor can sync live through a small Node/TypeScript websocket server. One
+connection carries the whole workspace: on connect the client and server
+exchange per-page digests, each side sends the pages whose digest differs, and
+edits afterwards are sent as per-page record deltas. Records are merged by
+last-write-wins on a Lamport clock, so offline edits reconcile automatically.
+
+Merging is at *block* granularity: a block's text and marks are one record, so
+two people editing the same block concurrently resolve last-write-wins and the
+losing version is replaced wholesale. Edits to different blocks merge cleanly;
+character-level merging within one block (as a text CRDT would provide) is not
+implemented. Deletes are tombstones that stay in the store so they keep
+propagating across reconnects, so the digest map grows with the number of pages
+ever created.
 
 Start the server:
 
@@ -90,10 +106,17 @@ ESSOR_SYNC_URL=ws://127.0.0.1:1234 cargo run --release
 ```
 
 With `ESSOR_SYNC_URL` unset the editor runs fully offline. Connections retry
-automatically with backoff if the server restarts, and edits made while
-disconnected are reconciled on reconnect. The server persists documents to
-LevelDB under `server/data`; see [server/README.md](server/README.md) for
-configuration and a smoke test.
+automatically with backoff if the server restarts. The server persists to SQLite
+under `server/data`; see [server/README.md](server/README.md) for configuration
+and a smoke test.
+
+## Agents (MCP)
+
+The sync server also exposes a Model Context Protocol endpoint at `POST /mcp`,
+so agents can list, read, create, and edit documents with structured blocks.
+With the server running, point an MCP client at `http://127.0.0.1:1234/mcp`; see
+[server/README.md](server/README.md#mcp-letting-agents-edit-documents) for the
+tool list and an example config.
 
 ## Keyboard and mouse
 
@@ -117,15 +140,19 @@ On macOS the command modifier is `Cmd`; on other platforms it is `Ctrl`.
 
 ## Architecture
 
-The document model lives behind the `Doc` trait in `src/doc.rs`, so the UI
-never depends on the CRDT crate directly. The current backend is
-`YrsDocument`, a `yrs` (Yjs) document holding a root array of block maps, each
-with a `kind` and a rich `Y.Text`.
+The editing interface is the `Doc` trait in `src/doc.rs`; the UI never depends on
+the store. The concrete implementation is `PageHandle` (`src/page.rs`), a
+per-page view over one `Workspace` (`src/workspace.rs`), which owns every page
+and block as a record in SQLite and merges them by last-write-wins on a Lamport
+clock. `src/runs.rs` holds the pure run-splicing helpers that preserve marks
+across an edit. Deletes are tombstones; block order uses fractional indices. Each
+page has a SHA-256 digest over its record versions for the reconnect handshake.
 
-`src/library.rs` owns the set of on-disk documents (the files and the JSON
-index) and `src/sidebar.rs` is the custom-painted document list. The root layout
-is a `Flex` row of the sidebar and a scrolling editor; the sidebar emits
-`SidebarAction`s that `main.rs` handles by swapping the editor's `Doc`.
+`src/library.rs` is the UI-facing catalog (the page list, titles and order, the
+active page) built on the workspace. `src/sidebar.rs` is the custom-painted
+document list. The root layout is a `Flex` row of the sidebar and a scrolling
+editor; the sidebar emits `SidebarAction`s that `main.rs` handles by swapping the
+editor's `Doc`.
 
 The editor widget is split into focused modules under `src/editor/`:
 
@@ -143,10 +170,9 @@ The editor widget is split into focused modules under `src/editor/`:
 
 `src/blink.rs` owns the caret-blink timer thread, and `src/main.rs` wires the
 widget into a `masonry_winit` window. `src/net/` owns the background websocket
-sync client: it shares a `yrs` document with a worker thread, forwards local
-edits to the server and relays remote edits back to the UI. `src/session.rs`
-orchestrates the connections — the shared page list and the active page — and
-`src/library.rs` owns the catalog and the local `.ydoc` files.
+client: a single multiplexed connection that forwards frames between the server
+and the UI thread. `src/session.rs` owns the handshake and the JSON message
+types.
 
 ## License
 

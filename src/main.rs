@@ -2,18 +2,24 @@ mod app;
 mod blink;
 mod doc;
 mod editor;
-mod fs;
+mod history;
 mod library;
+mod model;
 mod net;
+mod page;
 mod platform;
+mod runs;
 mod session;
 mod sidebar;
 mod theme;
+mod title;
+mod workspace;
 
 #[cfg(test)]
 mod test_support;
 
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use masonry::core::{NewWidget, WidgetId, WidgetTag};
@@ -34,9 +40,37 @@ pub(crate) const EDITOR_TAG: WidgetTag<Editor> = WidgetTag::new("editor");
 pub(crate) const SIDEBAR_TAG: WidgetTag<Sidebar> = WidgetTag::new("sidebar");
 pub(crate) const PORTAL_TAG: WidgetTag<Portal<Editor>> = WidgetTag::new("editor-portal");
 
-/// Where documents are persisted between sessions.
+/// Where documents are persisted between sessions. `ESSOR_DATA_DIR` overrides
+/// the platform location (used by tests and local experiments).
 fn data_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("ESSOR_DATA_DIR") {
+        return Some(PathBuf::from(dir));
+    }
     Some(dirs::data_dir()?.join("essor"))
+}
+
+/// Claim a data directory for this process, returning it and the held lock.
+///
+/// Two instances sharing one directory would share a SQLite file and a
+/// `client_id`, which breaks last-write-wins (their records look like echoes to
+/// each other). So each instance takes an advisory lock on `essor.lock`; a
+/// second instance must point `ESSOR_DATA_DIR` at a different directory.
+fn claim_data_dir(base: &Path) -> std::io::Result<(PathBuf, File)> {
+    std::fs::create_dir_all(base)?;
+    let lock_path = base.join("essor.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    file.try_lock().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "another Essor instance is already using this data directory; \
+             set ESSOR_DATA_DIR to a different path to run a second instance",
+        )
+    })?;
+    Ok((base.to_path_buf(), file))
 }
 
 fn main() {
@@ -64,8 +98,30 @@ fn main() {
     let sync_url = std::env::var("ESSOR_SYNC_URL")
         .ok()
         .filter(|url| !url.is_empty());
+    let online = sync_url.is_some();
 
-    let mut library = Library::open(data_dir());
+    let (document_dir, _instance_lock) = match data_dir() {
+        Some(base) => match claim_data_dir(&base) {
+            Ok((dir, lock)) => (Some(dir), Some(lock)),
+            Err(error) => {
+                eprintln!("essor: {error}");
+                std::process::exit(1);
+            }
+        },
+        None => (None, None),
+    };
+    let mut library = Library::open(document_dir).expect("failed to open the document library");
+    // Seed a first page so the UI has content before any sync. When online, the
+    // seed is provisional: it is withheld from the handshake until the server is
+    // known to be empty, so a fresh client can't push a blank page onto a
+    // populated library.
+    if library.entries().is_empty() {
+        if online {
+            library.create_provisional();
+        } else {
+            library.create();
+        }
+    }
 
     let notify: Notify = {
         let proxy = sync_proxy.clone();
@@ -75,12 +131,7 @@ fn main() {
             let _ = proxy.send_event(event);
         })
     };
-    let catalog = library.catalog_handle();
-    let catalog_dirty = library.catalog_dirty();
-    let mut session = SyncSession::start(sync_url, notify, catalog, catalog_dirty, &mut library);
-    // Mirror the catalog to page files and persist it, then open the active page.
-    library.sync_files();
-    library.save();
+    let session = SyncSession::start(sync_url, notify);
 
     let active_id = library
         .active_id()
@@ -89,8 +140,8 @@ fn main() {
     let active = library.active_index();
     let document = library
         .open_document(&active_id)
-        .expect("the active page has a file");
-    session.connect_document(document.handle(), active_id);
+        .expect("the active page exists");
+    session.flush(&library);
 
     let editor = Editor::new(Box::new(document), blink);
     let sidebar = Sidebar::new(entries, active);
@@ -118,4 +169,27 @@ fn main() {
         default_property_set(),
     )
     .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_instance_must_use_another_data_dir() {
+        let base = std::env::temp_dir().join(format!("essor-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let (dir, lock) = claim_data_dir(&base).unwrap();
+        assert_eq!(dir, base);
+
+        // A second instance on the same directory is refused.
+        assert!(claim_data_dir(&base).is_err());
+
+        // Releasing the lock frees the directory for the next run.
+        drop(lock);
+        let (_dir, lock_again) = claim_data_dir(&base).unwrap();
+        drop(lock_again);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

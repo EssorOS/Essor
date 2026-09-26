@@ -246,6 +246,9 @@ impl Editor {
             self.hover = Some(hover);
             ctx.request_render();
         }
+        if self.menu.is_some() && self.menu_hover(point) {
+            ctx.request_render();
+        }
         if !self.selection.dragging || !primary_down {
             return;
         }

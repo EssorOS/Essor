@@ -68,6 +68,20 @@ impl Menu {
             (MENU_WIDTH, MENU_PAD * 2.0 + MENU_ROW * rows as f64),
         )
     }
+
+    /// The visible row under `point`, if the point is inside the popup.
+    pub(super) fn row_at(&self, point: Point) -> Option<usize> {
+        let rect = self.rect();
+        if !rect.contains(point) {
+            return None;
+        }
+        let count = self.filtered().len();
+        if count == 0 {
+            return None;
+        }
+        let row = ((point.y - rect.y0 - MENU_PAD) / MENU_ROW) as usize;
+        Some(row.min(count - 1))
+    }
 }
 
 impl Editor {
@@ -173,6 +187,22 @@ impl Editor {
             }
             menu.selected = (menu.selected as isize + delta).clamp(0, count as isize - 1) as usize;
         }
+    }
+
+    /// Point the open menu's highlight at the row under `point`. Returns `true`
+    /// if the selection changed.
+    pub(super) fn menu_hover(&mut self, point: Point) -> bool {
+        let Some(menu) = &mut self.menu else {
+            return false;
+        };
+        let Some(row) = menu.row_at(point) else {
+            return false;
+        };
+        if menu.selected == row {
+            return false;
+        }
+        menu.selected = row;
+        true
     }
 
     pub(super) fn menu_confirm(&mut self) {
@@ -337,5 +367,34 @@ mod tests {
 
         menu.query.clear();
         assert_eq!(menu.filtered().len(), MenuItem::BLOCKS.len());
+    }
+
+    #[test]
+    fn row_at_maps_pointer_to_item() {
+        let menu = Menu {
+            block: 0,
+            anchor: Point::new(0.0, 0.0),
+            items: MenuItem::BLOCKS.to_vec(),
+            selected: 0,
+            slash: false,
+            query: String::new(),
+        };
+        let rect = menu.rect();
+
+        let row_y = |row: usize| rect.y0 + MENU_PAD + MENU_ROW * (row as f64 + 0.5);
+        let inside_x = rect.x0 + 10.0;
+
+        assert_eq!(menu.row_at(Point::new(inside_x, row_y(0))), Some(0));
+        assert_eq!(menu.row_at(Point::new(inside_x, row_y(2))), Some(2));
+
+        // Points outside the popup map to nothing.
+        assert_eq!(menu.row_at(Point::new(inside_x, rect.y0 - 5.0)), None);
+        assert_eq!(menu.row_at(Point::new(rect.x1 + 5.0, row_y(0))), None);
+
+        // Bottom padding clamps to the last row.
+        assert_eq!(
+            menu.row_at(Point::new(inside_x, rect.y1 - 1.0)),
+            Some(MenuItem::BLOCKS.len() - 1)
+        );
     }
 }

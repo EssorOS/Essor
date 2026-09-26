@@ -177,7 +177,7 @@ impl Editor {
         };
         let font_size = self
             .layout_of(self.selection.focus.block)
-            .map_or(DEFAULT_FONT_SIZE, |block| block.kind.font_size());
+            .map_or(DEFAULT_FONT_SIZE, |block| font_size(block.kind));
         let builder = base_builder(font_cx, layout_cx, &self.preedit, font_size);
         let mut layout = builder.build(&self.preedit);
         layout.break_all_lines(None);

@@ -21,7 +21,7 @@ use masonry::vello::Scene;
 use masonry::{TextAlign, TextAlignOptions};
 
 use crate::blink::{BLINK_INTERVAL, BlinkTimer};
-use crate::doc::{BlockId, BlockKind, Doc, Mark, TextRun};
+use crate::doc::{BlockId, BlockKind, Doc, Mark, RemoteUpdate, TextRun};
 
 mod cursor;
 mod edit;
@@ -157,7 +157,7 @@ impl Editor {
     /// document already has is a no-op. Returns whether anything changed. Runs
     /// on the UI thread, which owns the document's undo manager, so the remote
     /// edit is applied here rather than on the network worker.
-    pub fn apply_remote_update(&mut self, update: &[u8]) -> bool {
+    pub fn apply_remote_update(&mut self, update: RemoteUpdate<'_>) -> bool {
         if !self.doc.apply_remote(update) {
             return false;
         }
@@ -733,7 +733,7 @@ mod tests {
             .handle()
             .transact()
             .encode_state_as_update_v1(&StateVector::default());
-        peer.apply_remote(&state);
+        peer.apply_remote(RemoteUpdate::new(&state));
         change(&peer);
         let sv = doc.handle().transact().state_vector();
         peer.handle().transact().encode_state_as_update_v1(&sv)
@@ -764,7 +764,9 @@ mod tests {
 
         harness.edit_widget(EDITOR_TAG, |mut editor| {
             editor.widget.set_caret(Position::new(second, 3));
-            editor.widget.apply_remote_update(&update);
+            editor
+                .widget
+                .apply_remote_update(RemoteUpdate::new(&update));
             editor.ctx.request_layout();
         });
         // Run the requested layout pass so the cache and selection re-anchor.
@@ -804,7 +806,9 @@ mod tests {
 
         harness.edit_widget(EDITOR_TAG, |mut editor| {
             editor.widget.set_caret(Position::new(second, 0));
-            editor.widget.apply_remote_update(&update);
+            editor
+                .widget
+                .apply_remote_update(RemoteUpdate::new(&update));
             editor.ctx.request_layout();
         });
         harness.process_window_event(WindowEvent::Resize(PhysicalSize::new(800, 600)));

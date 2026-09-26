@@ -17,7 +17,7 @@ const UNDO_ORIGIN: &str = "local";
 /// Origin for updates applied on behalf of a sync peer. It keeps them out of the
 /// undo stack and lets the sync client tell remote edits from local ones so they
 /// are never echoed back.
-pub const REMOTE_ORIGIN: &str = "essor-remote";
+pub(crate) const REMOTE_ORIGIN: &str = "essor-remote";
 
 /// The kind of a block. Kept intentionally small for now.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,14 +45,6 @@ impl BlockKind {
             "heading2" => Self::Heading2,
             "bullet" => Self::Bullet,
             _ => Self::Paragraph,
-        }
-    }
-
-    pub fn font_size(self) -> f32 {
-        match self {
-            Self::Paragraph | Self::Bullet => 16.0,
-            Self::Heading1 => 28.0,
-            Self::Heading2 => 22.0,
         }
     }
 }
@@ -114,9 +106,30 @@ pub struct BlockSnapshot {
     pub kind: BlockKind,
 }
 
+/// A raw update received from a sync peer.
+///
+/// Wraps the backend's wire encoding so the [`Doc`] boundary does not traffic in
+/// bare byte slices; hand it to [`Doc::apply_remote`].
+#[derive(Clone, Copy, Debug)]
+pub struct RemoteUpdate<'a>(&'a [u8]);
+
+impl<'a> RemoteUpdate<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.0
+    }
+}
+
 /// The boundary the editor talks to. `yrs` lives entirely behind this trait, so the
 /// UI never depends on the CRDT crate directly. Swap in another backend later without
 /// touching the view layer.
+///
+/// This is a *UI-facing* port, not a backend-agnostic one: updates cross it as
+/// opaque [`RemoteUpdate`] bytes and are produced by the sync layer, which speaks
+/// the `yrs` wire protocol.
 pub trait Doc {
     /// Every block with its runs and kind, read in one transaction.
     fn snapshot(&self) -> Vec<BlockSnapshot>;
@@ -137,7 +150,7 @@ pub trait Doc {
     /// so it is not treated as a local edit. Returns whether it changed the
     /// document, so a peer's echo of a local edit can be ignored. Must be called
     /// on the thread that owns the document.
-    fn apply_remote(&self, update: &[u8]) -> bool;
+    fn apply_remote(&self, update: RemoteUpdate<'_>) -> bool;
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -407,8 +420,8 @@ impl Doc for YrsDocument {
         Ok(())
     }
 
-    fn apply_remote(&self, update: &[u8]) -> bool {
-        let Ok(update) = Update::decode_v1(update) else {
+    fn apply_remote(&self, update: RemoteUpdate<'_>) -> bool {
+        let Ok(update) = Update::decode_v1(update.as_bytes()) else {
             return false;
         };
         let mut txn = self.doc.transact_mut_with(REMOTE_ORIGIN);
@@ -553,12 +566,12 @@ mod tests {
         target.remove_block(first(&target));
 
         assert!(
-            target.apply_remote(&update),
+            target.apply_remote(RemoteUpdate::new(&update)),
             "first apply must change the document"
         );
         assert_eq!(target.text(first(&target)), "hello");
         assert!(
-            !target.apply_remote(&update),
+            !target.apply_remote(RemoteUpdate::new(&update)),
             "re-applying a known update must be a no-op"
         );
     }
@@ -575,7 +588,7 @@ mod tests {
 
         let target = YrsDocument::new();
         target.remove_block(first(&target));
-        assert!(target.apply_remote(&update));
+        assert!(target.apply_remote(RemoteUpdate::new(&update)));
         assert_eq!(target.len(), 2);
 
         // Delete a block on the source and send only the diff: a delete-only
@@ -583,7 +596,7 @@ mod tests {
         source.remove_block(second);
         let target_sv = target.doc.transact().state_vector();
         let deletion = source.doc.transact().encode_state_as_update_v1(&target_sv);
-        assert!(target.apply_remote(&deletion));
+        assert!(target.apply_remote(RemoteUpdate::new(&deletion)));
         assert_eq!(target.len(), 1);
     }
 

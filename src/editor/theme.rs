@@ -1,6 +1,12 @@
-use masonry::peniko::Color;
-
 use crate::doc::BlockKind;
+
+/// The shared palette, re-exported under the names this widget has always used
+/// so the editor submodules reach it through `use super::*`.
+pub(super) use crate::theme::{
+    HAIRLINE as MENU_BORDER, INK as BULLET, INK as CARET, INK as TEXT, MENU_SELECTED, PLACEHOLDER,
+    PLACEHOLDER as GUTTER_ICON_COLOR, SELECTION, SHADOW as MENU_SHADOW, SURFACE as BACKGROUND,
+    SURFACE as MENU_BG,
+};
 
 pub(super) const PAGE_MAX_WIDTH: f64 = 900.0;
 pub(super) const PAGE_MARGIN: f64 = 48.0;
@@ -31,18 +37,14 @@ pub(super) const DOT_RADIUS: f64 = 1.15;
 pub(super) const DOT_COLUMNS: [f64; 2] = [-2.4, 2.4];
 pub(super) const DOT_ROWS: [f64; 3] = [-4.0, 0.0, 4.0];
 
-// Notion-ish light theme.
-pub(super) const BACKGROUND: Color = Color::from_rgb8(0xff, 0xff, 0xff);
-pub(super) const TEXT: Color = Color::from_rgb8(0x37, 0x35, 0x2f);
-pub(super) const PLACEHOLDER: Color = Color::from_rgb8(0xb8, 0xb7, 0xb4);
-pub(super) const BULLET: Color = Color::from_rgb8(0x37, 0x35, 0x2f);
-pub(super) const GUTTER_ICON_COLOR: Color = Color::from_rgb8(0xb8, 0xb7, 0xb4);
-pub(super) const CARET: Color = Color::from_rgb8(0x37, 0x35, 0x2f);
-pub(super) const SELECTION: Color = Color::from_rgba8(0x23, 0x83, 0xe2, 0x40);
-pub(super) const MENU_BG: Color = Color::from_rgb8(0xff, 0xff, 0xff);
-pub(super) const MENU_BORDER: Color = Color::from_rgb8(0xe9, 0xe9, 0xe7);
-pub(super) const MENU_SELECTED: Color = Color::from_rgb8(0xf1, 0xf1, 0xef);
-pub(super) const MENU_SHADOW: Color = Color::from_rgba8(0x0f, 0x0f, 0x0f, 0x12);
+/// Per-kind font size, in logical pixels.
+pub(super) fn font_size(kind: BlockKind) -> f32 {
+    match kind {
+        BlockKind::Paragraph | BlockKind::Bullet => 16.0,
+        BlockKind::Heading1 => 28.0,
+        BlockKind::Heading2 => 22.0,
+    }
+}
 
 /// Per-kind line height (multiple of font size) and space above the block.
 pub(super) fn block_metrics(kind: BlockKind) -> (f32, f64) {

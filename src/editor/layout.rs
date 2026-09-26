@@ -37,7 +37,7 @@ pub(super) fn build_block_layout(
     let wrap = (width - indent(kind) as f32).max(1.0);
     let layout = build_layout(fcx, lcx, &runs, kind, wrap);
     let (line_height, _) = block_metrics(kind);
-    let height = (layout.height() as f64).max(kind.font_size() as f64 * line_height as f64);
+    let height = (layout.height() as f64).max(font_size(kind) as f64 * line_height as f64);
     BlockLayout {
         id,
         layout,
@@ -73,7 +73,7 @@ pub(super) fn build_layout(
     width: f32,
 ) -> Layout<BrushIndex> {
     let text = runs.iter().map(|run| run.text.as_str()).collect::<String>();
-    let mut builder = base_builder(fcx, lcx, &text, kind.font_size());
+    let mut builder = base_builder(fcx, lcx, &text, font_size(kind));
     let (line_height, _) = block_metrics(kind);
     builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(
         line_height,

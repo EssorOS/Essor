@@ -8,7 +8,7 @@ use masonry::parley::{
     FontContext, Layout, LayoutContext,
     style::{FontFamily, FontStack, FontWeight, GenericFamily, StyleProperty},
 };
-use masonry::peniko::{Brush, Color, Fill};
+use masonry::peniko::{Brush, Fill};
 use masonry::vello::Scene;
 use masonry::{TextAlign, TextAlignOptions};
 
@@ -31,15 +31,11 @@ const CONFIRM_BUTTON_H: f64 = 30.0;
 const FONT_SIZE: f32 = 14.0;
 const TITLE_SIZE: f32 = 13.0;
 
-const BACKGROUND: Color = Color::from_rgb8(0xf6, 0xf6, 0xf4);
-const BORDER: Color = Color::from_rgb8(0xe9, 0xe9, 0xe7);
-const TEXT: Color = Color::from_rgb8(0x37, 0x35, 0x2f);
-const MUTED: Color = Color::from_rgb8(0x9b, 0x9a, 0x97);
-const ROW_HOVER: Color = Color::from_rgb8(0xee, 0xee, 0xec);
-const ROW_ACTIVE: Color = Color::from_rgb8(0xe4, 0xe4, 0xe2);
-const CONFIRM_BG: Color = Color::from_rgb8(0xff, 0xff, 0xff);
-const DANGER: Color = Color::from_rgb8(0xc0, 0x39, 0x2b);
-const SHADOW: Color = Color::from_rgba8(0x0f, 0x0f, 0x0f, 0x14);
+// Surface colors, from the shared palette, under the names this widget uses.
+use crate::theme::{
+    DANGER, HAIRLINE as BORDER, INK as TEXT, MUTED, SHADOW, SIDEBAR_ACTIVE as ROW_ACTIVE,
+    SIDEBAR_BG as BACKGROUND, SIDEBAR_HOVER as ROW_HOVER, SURFACE as CONFIRM_BG,
+};
 
 /// A document row rendered in the sidebar.
 #[derive(Clone, Debug)]
